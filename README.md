@@ -472,7 +472,7 @@ ARTEX 内置原生静态代码审计能力：在原有双图/planner/worker 调�
 - **安全边界**：静态阶段不执行目标代码/构建/测试；审计 worker 无 Bash/网络/源码写入工具；CodeQL 仅 `build-mode=none` 或预构建 DB；Joern 只解析。
 - **界面**：任务创建支持代码审计模式；任务详情新增“代码审计”页签（引擎状态、阶段、覆盖度、门禁、候选、报告）；漏洞详情展示结构化代码证据。
 
-详细安装（CodeGraph/CodeQL/Joern、query packs、本地根目录）、API、阅读方式和当前限制见 [`docs/code-audit-usage.md`](docs/code-audit-usage.md)。
+详细安装（CodeGraph/CodeQL/Joern、query packs、本地根目录）、API、阅读方式和当前限制见 [`docs/code-audit-usage.md`](docs/code-audit-usage.md)；实现进度与下一步规划见 [`docs/superpowers/specs/2026-10-27-artex-code-audit-progress-roadmap.md`](docs/superpowers/specs/2026-10-27-artex-code-audit-progress-roadmap.md)。
 
 > 当前版本为静态审计闭环，多轮聚焦补扫、动态部署/PoC 执行和完整归档支持仍在后续计划中；引擎不可用/不支持的语言会作为覆盖缺口写入报告，不会静默忽略。
 

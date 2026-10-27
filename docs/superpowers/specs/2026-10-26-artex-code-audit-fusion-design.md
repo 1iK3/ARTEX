@@ -1,8 +1,9 @@
 # ARTEX 代码审计融合设计（CodeGraph / CodeQL / Joern）
 
 - 日期：2026-10-26
-- 状态：已确认，待实现
+- 状态：设计已确认；M1/M2 部分、M4 部分已实现，进度见 `docs/superpowers/specs/2026-10-27-artex-code-audit-progress-roadmap.md`
 - 范围：在 ARTEX 内原生开发静态代码审计与漏洞挖掘能力，融合 Omni-Audit 的审计模块、方法论和质量门禁；动态部署验证不在本轮范围。
+- 实现基线：本地提交 `a137d14`（分支 `feat/code-audit`，尚未推送）
 - 输入源：Git 仓库、服务器本地目录、上传压缩包。
 - 分析引擎：CodeGraph（主分析底座）、CodeQL（数据流/SARIF）、Joern（CPG/CFG）、原生只读兜底。
 - 交付形态：Go 后端 + API + Next.js 全栈界面 + PostgreSQL 持久化。
