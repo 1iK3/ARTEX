@@ -151,6 +151,10 @@ type Engine struct {
 	// readiness reports whether a global LLM provider is configured — the signal behind
 	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
 	readiness func() bool
+	// intentObserver is called after a final intent state write (done/blocked/
+	// exhausted/stopped). The audit director uses it for phase bookkeeping and a
+	// planner wake; pentest tasks ignore it. nil → no observer.
+	intentObserver func(t *Task, intentID int64, state string)
 }
 
 type taskRuntime struct {
@@ -715,6 +719,19 @@ func (e *Engine) SetAuthoritativeAgentResolver(fn func(t *Task) (*agent.Planner,
 	e.resolveAuthoritative = true
 }
 
+// SetIntentObserver installs the post-final-state callback used by the audit
+// director. Called once at startup; nil disables it.
+func (e *Engine) SetIntentObserver(fn func(t *Task, intentID int64, state string)) {
+	e.intentObserver = fn
+}
+
+func (e *Engine) observeIntent(t *Task, intentID int64, state string) {
+	if e.intentObserver == nil || t == nil {
+		return
+	}
+	e.intentObserver(t, intentID, state)
+}
+
 // snapshotFor returns the planner/worker a task should run on, from the task-router
 // resolver. nil,nil means the task is deliberately unavailable (e.g. an exhausted
 // failover chain); there is no global-pair fallback.
@@ -1104,6 +1121,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 			log.Printf("[worker %s] task %s 意图 #%d 超时收尾状态落库失败: %v", name, t.ID, intent.ID, err)
 		}
 		log.Printf("[worker %s] task %s 意图 #%d 因任务超时收尾结束(exhausted)，写回 %s", name, t.ID, intent.ID, wrote)
+		e.observeIntent(t, intent.ID, "exhausted")
 		e.touch(t.ID)
 		return true
 	}
@@ -1114,6 +1132,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 			log.Printf("[worker %s] task %s 意图 #%d 终态停止落库失败: %v", name, t.ID, intent.ID, err)
 		}
 		log.Printf("[worker %s] task %s 意图 #%d 因任务已完成而取消(stopped)", name, t.ID, intent.ID)
+		e.observeIntent(t, intent.ID, "stopped")
 		e.touch(t.ID)
 		return true
 	}
@@ -1123,6 +1142,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 			log.Printf("[worker %s] task %s 意图 #%d planner 停止落库失败: %v", name, t.ID, intent.ID, err)
 		}
 		log.Printf("[worker %s] task %s 意图 #%d 被终止(stopped)", name, t.ID, intent.ID)
+		e.observeIntent(t, intent.ID, "stopped")
 		e.touch(t.ID)
 		t.Notify()
 		return true
@@ -1150,6 +1170,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 			log.Printf("[worker %s] task %s 意图 #%d 终态 %s 落库失败: %v", name, t.ID, intent.ID, state, stateErr)
 		}
 	}
+	e.observeIntent(t, intent.ID, state)
 	log.Printf("[worker %s] task %s 意图 #%d 结束: %s (写回 %s)", name, t.ID, intent.ID, state, wrote)
 	e.touch(t.ID)
 	t.NotifyDone(intent.ID) // results changed the graph -> wake the planner (with the just-finished intent id)

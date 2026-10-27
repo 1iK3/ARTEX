@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/audit"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -240,11 +241,32 @@ func (s *Server) toolListLLMProfiles() actool.CoreTool {
 
 func (s *Server) toolSpawnTask() actool.CoreTool {
 	return wrTool("spawn_task",
-		"新建一个子任务并启动探索引擎，返回 task_id。用于把一件事(如一道题/一个目标)派成独立任务。parent_ref 可选：填当前编排关联的父任务 id 做父子关联。",
+		"新建一个子任务并启动探索引擎，返回 task_id。用于把一件事(如一道题/一个目标)派成独立任务。parent_ref 可选：填当前编排关联的父任务 id 做父子关联。task_mode=code_audit 时派发代码审计子任务，必须同时提供 audit 配置。",
 		objSchema(map[string]any{
-			"description":            strParam("任务描述(简短标题)"),
-			"goal":                   strParam("任务目标(要达成什么)"),
-			"parent_ref":             strParam("可选：父任务 id(做父子关联)"),
+			"description": strParam("任务描述(简短标题)"),
+			"goal":        strParam("任务目标(要达成什么)"),
+			"parent_ref":  strParam("可选：父任务 id(做父子关联)"),
+			"task_mode":   map[string]any{"type": "string", "enum": []any{db.TaskModePentest, db.TaskModeCodeAudit}, "description": "可选：任务模式。默认 pentest；code_audit 必须同时提供 audit 配置，且不会走渗透 seed/目标拆解流程。"},
+			"audit": map[string]any{
+				"type":        "object",
+				"description": "可选：code_audit 的审计配置(仅 task_mode=code_audit)。source_type=local 时 local_path 必须位于服务端 ARTEX_AUDIT_LOCAL_ROOTS 配置的根目录内。",
+				"properties": map[string]any{
+					"source_type":    map[string]any{"type": "string", "enum": []any{audit.SourceGit, audit.SourceLocal, audit.SourceZip}, "description": "源码来源类型"},
+					"repo_url":       strParam("source_type=git 时的仓库 URL；只允许 https 或 ssh"),
+					"ref":            strParam("可选：分支/tag/commit"),
+					"local_path":     strParam("source_type=local 时的服务端本地目录"),
+					"upload_id":      strParam("source_type=zip 时已上传的 staging id"),
+					"depth":          map[string]any{"type": "string", "enum": []any{audit.DepthQuick, audit.DepthStandard, audit.DepthDeep}, "description": "审计深度；默认 deep"},
+					"cwe_scope":      map[string]any{"type": "string", "enum": []any{audit.CWEScopeCore, audit.CWEScopeFull, audit.CWEScopeExplicit}, "description": "CWE 范围；默认 core"},
+					"cwe_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：cwe_scope=explicit 时的 CWE 编号，如 CWE-89"},
+					"languages":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：语言过滤；未知语言会记为覆盖缺口"},
+					"max_rounds":     map[string]any{"type": "integer", "minimum": 1, "maximum": 10, "description": "可选：最大审计轮次；默认 quick=1/standard=3/deep=5"},
+					"engines":        map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "可选：codegraph/codeql/joern 引擎开关；codegraph 可选 required|auto|off，codeql/joern 仅 auto|off"},
+					"budgets":        map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "number"}, "description": "可选：预算(非负数字)，如 max_workers/max_sink_sites_per_cwe"},
+					"include_tests":  map[string]any{"type": "boolean", "description": "可选：是否包含测试代码"},
+					"include_vendor": map[string]any{"type": "boolean", "description": "可选：是否包含 vendor 依赖"},
+				},
+			},
 			"source_task_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": fmt.Sprintf("可选：只读继承的来源任务 id 列表(最多 %d 个)。子任务可只读引用这些任务已探明的资产/结论作为起点；与 parent_ref 的纯父子指针不同，这是内容继承。", db.MaxTaskSourceCount)},
 			"llm_profile_id":         map[string]any{"type": "integer", "description": "可选：指定本子任务 planner/worker 用的 LLM 配置 id(见 list_llm_profiles)；留空则继承父任务、再回退全局激活配置"},
 			"timeout_seconds":        map[string]any{"type": "integer", "description": "可选：任务级超时(秒)。到点后触发优雅收尾并进入 timeout 终态；留空或 0 = 不限时"},
@@ -256,6 +278,8 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 				Description          string          `json:"description"`
 				Goal                 string          `json:"goal"`
 				ParentRef            string          `json:"parent_ref"`
+				TaskMode             string          `json:"task_mode"`
+				Audit                json.RawMessage `json:"audit"`
 				SourceTaskIDs        []string        `json:"source_task_ids"`
 				LLMProfileID         json.RawMessage `json:"llm_profile_id"`
 				TimeoutSeconds       int             `json:"timeout_seconds"`
@@ -266,7 +290,15 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			if strings.TrimSpace(a.Description) == "" {
 				a.Description = "未命名任务"
 			}
-			if strings.TrimSpace(a.Goal) == "" {
+			auditCfg, err := decodeAuditConfig(a.Audit)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			modeOptions, err := resolveTaskModeOptions(a.TaskMode, auditCfg, a.Goal, s.auditLocalRoots())
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if strings.TrimSpace(modeOptions.Goal) == "" {
 				return actool.Errorf("goal 为必填"), nil
 			}
 			if a.TimeoutSeconds < 0 {
@@ -305,11 +337,13 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			if pin != nil {
 				llmIDs = []int64{*pin}
 			}
-			t, err := s.m.CreateTaskWithOptions(a.Description, a.Goal, db.TaskCreateOptions{
+			t, err := s.m.CreateTaskWithOptions(a.Description, modeOptions.Goal, db.TaskCreateOptions{
 				SourceTaskIDs:        sourceIDs,
 				LLMProfileIDs:        llmIDs,
 				TimeoutSeconds:       a.TimeoutSeconds,
 				PlanHeartbeatSeconds: a.PlanHeartbeatSeconds,
+				Mode:                 modeOptions.Mode,
+				AuditConfig:          modeOptions.AuditConfig,
 			})
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -322,8 +356,9 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			}
 			// 共享的建后流程,与 HTTP 建任务(server.go createTask)复用同一段 launchTask:
 			// seed + 后台可见地做目标分解(第0轮/LLM步骤/逐条goal) + engine.Run。
+			// code_audit 会跳过 seed/goal 流程,在导演接入前由安全的占位分支停止。
 			// seed_first_intent 默认 false(标准先规划再执行);简单任务可开启直接下发一 work 测试。
-			s.launchTask(t, a.Description+" "+a.Goal, a.SeedFirstIntent)
+			s.launchTask(t, a.Description+" "+modeOptions.Goal, a.SeedFirstIntent)
 			return actool.Text(fmt.Sprintf("task created: %s", t.ID)), nil
 		})
 }
@@ -514,7 +549,7 @@ func (s *Server) seedOrchestrationTools() {
 // reaches an old DB otherwise. Preserves each tool's agent binding + enabled flag.
 // Bump the flag whenever these tools' schemas/descriptions change in code.
 func (s *Server) refreshBuiltinToolSchemas() {
-	const flag = "tool_schema_refresh_v7_list_facts_paging"
+	const flag = "tool_schema_refresh_v8_audit_task_mode"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}

@@ -85,6 +85,27 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+
+	// --- code-audit mode ---
+	// auditMode swaps the worker's tool base for the curated AuditWorkerTools
+	// surface (no SDK defaults, no WebFetch/WebSearch, no Bash). The curated tool
+	// list is the security boundary; PermissionMode stays ModeBypass because every
+	// reachable tool is already audit-safe.
+	auditMode bool
+	// agentKey is the agent identity used for prompt overrides, skill/MCP
+	// visibility and the DB tools table. Default "worker".
+	agentKey string
+	// auditDeps / auditCodeGraph / auditSourceRoot / auditFallback are forwarded
+	// to the per-run ToolSet.
+	auditDeps       AuditDeps
+	auditCodeGraph  AuditCodeGraph
+	auditSourceRoot string
+	auditFallback   bool
+
+	// notify, if set, is the generic planner wake (debounced by the engine). It
+	// makes audit verification/hypothesis/intent-complete writes visible to the
+	// planner even though they are not new findings. nil = no wake.
+	notify func()
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -137,6 +158,66 @@ func (w *Worker) maxTokens() int {
 // SetConstraintInject wires a resolver deciding whether this task's operation
 // constraints get injected into the worker system prompt. nil = inject (default).
 func (w *Worker) SetConstraintInject(fn func() bool) { w.injectConstraints = fn }
+
+// SetAuditMode switches this worker to the curated code-audit tool surface.
+func (w *Worker) SetAuditMode(enabled bool) { w.auditMode = enabled }
+
+// SetAgentKey sets the agent identity (default "worker") used for prompt
+// overrides, skill/MCP visibility and the DB tools table.
+func (w *Worker) SetAgentKey(key string) { w.agentKey = strings.TrimSpace(key) }
+
+// SetAuditDeps wires the audit persistence/engine facade.
+func (w *Worker) SetAuditDeps(deps AuditDeps) { w.auditDeps = deps }
+
+// SetAuditCodeGraph wires the task-scoped CodeGraph client.
+func (w *Worker) SetAuditCodeGraph(graph AuditCodeGraph) { w.auditCodeGraph = graph }
+
+// SetAuditSourceRoot sets the read-only source snapshot root for fallback tools.
+func (w *Worker) SetAuditSourceRoot(root string) { w.auditSourceRoot = root }
+
+// SetAuditFallback enables the read-only code_search/code_read fallback tools.
+func (w *Worker) SetAuditFallback(enabled bool) { w.auditFallback = enabled }
+
+// SetNotify wires the generic planner wake used by audit writes that are not
+// new findings (verification, hypothesis, intent completion). The engine
+// supplies a debounced callback; nil disables the wake.
+func (w *Worker) SetNotify(fn func()) { w.notify = fn }
+
+func (w *Worker) resolvedAgentKey() string {
+	if w.agentKey != "" {
+		return w.agentKey
+	}
+	// Audit mode is forced onto the code-audit identity even when the caller
+	// forgot SetAgentKey, so prompt overrides and audit bindings cannot silently
+	// fall back to the pentest worker identity. The curated tool list is still
+	// bound directly in code; the key is the identity used for prompts/logs.
+	if w.auditMode {
+		return "code_worker"
+	}
+	return "worker"
+}
+
+// resetAuditLoopBudget starts a fresh CodeGraph cumulative result budget for
+// this audit run. A task-scoped client is shared across sequential intents, so
+// without this reset the previous intent's 60K budget would suppress this one's
+// source context. No-op in pentest mode or when no CodeGraph is wired.
+func (w *Worker) resetAuditLoopBudget() {
+	if w.auditMode && w.auditCodeGraph != nil {
+		w.auditCodeGraph.ResetLoopBudget()
+	}
+}
+
+// workerBaseTools is the pure base-tool selection used by execute. Keeping it
+// separate makes the audit-vs-pentest surface unit-testable without an LLM.
+func (w *Worker) workerBaseTools(tsx *ToolSet) []actool.CoreTool {
+	if w.auditMode {
+		// Curated audit surface: no host extraTools, no SDK DefaultTools, no
+		// WebFetch/WebSearch/Bash. Do not "helpfully" append anything here.
+		return tsx.AuditWorkerTools()
+	}
+	base := append(tsx.WorkerTools(), w.extraTools...)
+	return append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
+}
 
 // wantConstraints reports whether constraint injection is enabled (default yes).
 func (w *Worker) wantConstraints() bool { return w.injectConstraints == nil || w.injectConstraints() }
@@ -286,7 +367,15 @@ func ensureRunDir(base string, taskID, intentID int64) string {
 func cmdOutDir(dir string) string { return filepath.Join(dir, "cmd-output") }
 
 func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
-	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
+	return workerSystemFor("worker", proxyAddr, caCert, dataDir, runDir)
+}
+
+// workerSystemFor is workerSystem with an explicit agent key so code-audit (and
+// any custom) workers render their own prompt overrides while keeping the
+// code-owned pentest tail. Audit mode does NOT use this function: it must not
+// inherit the traffic/artifact (Bash-oriented) blocks.
+func workerSystemFor(agentKey, proxyAddr, caCert, dataDir, runDir string) string {
+	body := renderSystem(agentKey, workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
@@ -315,6 +404,12 @@ func intentAssetIDs(intent *db.Node) []int64 {
 
 func renderIntentTask(intent *db.Node) string {
 	return fmt.Sprintf("\n\n【你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）】：\n%s\n意图 id: %d（写回 record_fact / report_finding 时传它）", string(intent.Payload), intent.ID)
+}
+
+// renderAuditIntentTask is the code-audit variant: write-back tools are the
+// audit ones, and completing the intent requires a coverage receipt.
+func renderAuditIntentTask(intent *db.Node) string {
+	return fmt.Sprintf("\n\n【你领到的审计意图（本次唯一任务：完成它并提交覆盖回执）】：\n%s\n意图 id: %d（report_code_finding / audit_intent_complete 时传它）", string(intent.Payload), intent.ID)
 }
 
 // renderWorkerGraphOverview folds the global situational snapshot into the worker's
@@ -370,15 +465,25 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tsx.SetOwnerNode(intent.ID)         // assets this worker discovers anchor to its intent → visible to the task
 	tsx.SetEnrich(enr)                  // async DNS/HTTP auto-completion for assets this worker writes
 	tsx.SetNotifyFinding(notifyFinding) // report_finding 落库时当场唤醒 planner，带上「哪个意图+finding」
+	tsx.SetNotify(w.notify)             // audit verification/hypothesis/coverage writes wake the planner
+	tsx.SetAuditMode(w.auditMode)
+	tsx.SetAuditDeps(w.auditDeps)
+	tsx.SetAuditCodeGraph(w.auditCodeGraph)
+	tsx.SetAuditSourceRoot(w.auditSourceRoot)
+	tsx.SetAuditFallback(w.auditFallback)
+	// A task-scoped CodeGraph client is reused across intents; reset its loop
+	// budget before this intent's first query.
+	w.resetAuditLoopBudget()
+	agentKey := w.resolvedAgentKey()
 	// base = built-in worker tools ∪ host tools (traffic) ∪ default tools (incl. Bash);
 	// then augment with the agent's visible skills/MCP. During the SDK settlement
 	// phase, Bash is hidden via Settlement.DisabledTools (no local gating needed).
-	base := append(tsx.WorkerTools(), w.extraTools...)
-	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
-	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
-	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
+	// Audit mode replaces the whole base with the curated audit surface.
+	base := w.workerBaseTools(tsx)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
-	tools, def, cleanup := AugmentTools(ctx, "worker", base)
+	// Audit mode bypasses AugmentTools entirely (see assembleAgentTools): MCP,
+	// skills, interactive_shell, host tools and DB bindings cannot add tools.
+	tools, def, cleanup := assembleAgentTools(ctx, w.auditMode, agentKey, base)
 	defer cleanup()
 
 	// 意图是 worker 的【唯一职责、贯穿整个 run 的不变量】→ 连同启动指令、意图锚定的目标资产
@@ -393,12 +498,23 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	sysBody := ""
+	if w.auditMode {
+		// Code-owned audit discipline; no pentest traffic/artifact blocks (audit
+		// workers have neither shell nor traffic tools).
+		sysBody = auditWorkerSystem(agentKey, w.workDir)
+	} else {
+		sysBody = workerSystemFor(agentKey, w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	}
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
 	// 意图块 → 意图锚定资产块 → 启动指令，依次追加到 system 尾部（与 constraintBlock 同一套追加法）。
-	sysBody += renderIntentTask(intent)
+	if w.auditMode {
+		sysBody += renderAuditIntentTask(intent)
+	} else {
+		sysBody += renderIntentTask(intent)
+	}
 	if as != nil {
 		if ids := intentAssetIDs(intent); len(ids) > 0 {
 			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {
@@ -417,14 +533,36 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 			}
 		}
 	}
-	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
+	if w.auditMode {
+		sysBody += "\n\n开始执行上面这条意图：只用审计工具分析并写回证据；完成覆盖回执（audit_intent_complete）后停止。"
+	} else {
+		sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
+	}
 	system, boundary := deferredSystem(sysBody, def)
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
 	tc := taskClockFrom(ctx)
 	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)
-	settle := wrapupSettlement("worker", []string{"Bash"})
+	// Settlement prompts are resolved by agent key too. Audit runs must not fall
+	// back to the pentest worker wrap-up (which points at insert_assets /
+	// report_finding / Bash); with the audit key they use the generic "write back
+	// what you have" prompt until a code_worker-specific override is configured.
+	settleKey := "worker"
+	if w.auditMode {
+		settleKey = agentKey
+	}
+	settle := wrapupSettlement(settleKey, []string{"Bash"})
 	if tc.DeadlineUnix > 0 {
-		settle = wrapupSettlementForTask("worker", []string{"Bash"}, clamped)
+		settle = wrapupSettlementForTask(settleKey, []string{"Bash"}, clamped)
+	}
+	// Audit runs are offline by construction: WebFetch/WebSearch/Bash are off in
+	// addition to being absent from the curated tool list. The tool list is the
+	// security boundary, which is why ModeBypass is safe here: nothing reachable
+	// can execute target code, reach the network, or mutate the source tree.
+	enableWebFetch := true
+	enableWebSearch := w.webSearch.Enabled
+	bashEnv := proxyEnv(w.proxyAddr, w.proxyCACert)
+	if w.auditMode {
+		enableWebFetch, enableWebSearch, bashEnv = false, false, nil
 	}
 	opts := agentcore.Options{
 		Provider:        w.prov,
@@ -436,12 +574,12 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		PermissionMode:  permission.ModeBypass,
 		// WebFetch 走记录代理，其 HTTP 与 curl 一样被留痕；载入代理 CA 让经 MITM
 		// 重签的 HTTPS 证书能【正常校验通过】（而非关掉校验）。proxy 空则直连。
-		EnableWebFetch: true,
+		EnableWebFetch: enableWebFetch,
 		WebFetchProxy:  w.proxyAddr,
 		WebFetchCACert: w.proxyCACert,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
 		// WebSearchProxy 是独立的出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
-		EnableWebSearch:       w.webSearch.Enabled,
+		EnableWebSearch:       enableWebSearch,
 		WebSearchBackend:      w.webSearch.Backend,
 		BraveSearchAPIKey:     w.webSearch.BraveKey,
 		TavilySearchAPIKey:    w.webSearch.TavilyKey,
@@ -450,7 +588,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		DeepSeekSearchModel:   w.webSearch.DeepSeekModel,
 		WebSearchProxy:        w.webSearch.Proxy,
 		// Bash 子命令的 HTTP 默认走记录代理 + 信任其 CA（工具无需 -x/-k）。
-		BashEnv:    proxyEnv(w.proxyAddr, w.proxyCACert),
+		BashEnv:    bashEnv,
 		WorkingDir: runDir,
 		MaxTurns:   w.maxTurns, // 0 = unlimited (configurable in agent management)
 		// 墙钟预算,轮边界判,不打断半路;0 = 不限。有任务级 deadline 时夹逼到 min(自身预算,
@@ -467,6 +605,12 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		Todos:         actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
 		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
+	}
+	if w.auditMode {
+		// The SDK otherwise auto-injects TaskOutput/TaskStop/TaskList/Monitor;
+		// Monitor can spawn an arbitrary shell command. DisallowedTools is the
+		// permission-layer backup in addition to the curated Tools list.
+		opts.DisableBackgroundTasks, opts.DisallowedTools = auditSessionSafetyOptions()
 	}
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks
@@ -487,7 +631,11 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// overview 罕见地 marshal 失败为空时，回退一句启动词，避免首轮出现空 user 消息。
 	input := overview
 	if strings.TrimSpace(input) == "" {
-		input = "开始执行 system 里领到的意图：只做它、只产生事实、assets、finding、做完即停。"
+		if w.auditMode {
+			input = "开始执行 system 里领到的审计意图：只用审计工具分析并提交覆盖回执，完成后停止。"
+		} else {
+			input = "开始执行 system 里领到的意图：只做它、只产生事实、assets、finding、做完即停。"
+		}
 	}
 
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。

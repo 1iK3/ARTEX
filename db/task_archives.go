@@ -46,6 +46,9 @@ var (
 	ErrTaskArchiveState          = errors.New("task archive state does not allow this operation")
 	ErrTaskArchiveDeleteBlocked  = errors.New("task archive is required by another archive")
 	ErrTaskArchiveFormatMismatch = errors.New("task archive format is not supported")
+	// ErrTaskArchiveUnsupported is temporary until M5 adds audit tables to the
+	// archive snapshot. Refusing is safer than silently dropping audit state.
+	ErrTaskArchiveUnsupported = errors.New("task mode does not support archiving yet")
 )
 
 // TaskArchive is the compact PostgreSQL record retained while a task is cold.
@@ -223,21 +226,25 @@ func (d *DB) QueueTaskArchive(taskID int64) (*TaskArchive, error) {
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	var name, description, goal, status, categoryName string
+	var name, description, goal, status, categoryName, mode string
 	var categoryID *int64
 	var paused, queued bool
 	var deadline *time.Time
 	err = tx.QueryRow(`SELECT COALESCE(t.name,''), t.description, t.goal, t.status,
- t.category_id, COALESCE(c.name,''), t.paused, t.queued, t.deadline_at
+ t.category_id, COALESCE(c.name,''), t.paused, t.queued, t.deadline_at,
+ COALESCE(t.task_mode,'pentest')
 FROM tasks t LEFT JOIN task_categories c ON c.id=t.category_id
 WHERE t.id=$1 AND t.deleted_at IS NULL FOR UPDATE OF t`, taskID).Scan(
-		&name, &description, &goal, &status, &categoryID, &categoryName, &paused, &queued, &deadline,
+		&name, &description, &goal, &status, &categoryID, &categoryName, &paused, &queued, &deadline, &mode,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrTaskArchiveNotFound
 	}
 	if err != nil {
 		return nil, err
+	}
+	if mode == TaskModeCodeAudit {
+		return nil, fmt.Errorf("%w: task %d", ErrTaskArchiveUnsupported, taskID)
 	}
 	if queued {
 		return nil, ErrTaskArchiveQueued
@@ -563,11 +570,16 @@ func (d *DB) snapshotTaskArchive(taskID int64, llmRecords io.Writer) (*TaskArchi
 		return nil, err
 	}
 	var expID int64
-	if err := tx.QueryRow(`SELECT exploration_id FROM tasks WHERE id=$1 AND deleted_at IS NULL`, taskID).Scan(&expID); err != nil {
+	var mode string
+	if err := tx.QueryRow(`SELECT exploration_id, COALESCE(task_mode,'pentest')
+FROM tasks WHERE id=$1 AND deleted_at IS NULL`, taskID).Scan(&expID, &mode); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrTaskArchiveNotFound
 		}
 		return nil, err
+	}
+	if mode == TaskModeCodeAudit {
+		return nil, fmt.Errorf("%w: task %d", ErrTaskArchiveUnsupported, taskID)
 	}
 	tables := make(map[string]json.RawMessage)
 	queries := []struct {

@@ -1534,3 +1534,37 @@ func scanAssets(rows *sql.Rows) ([]*Asset, error) {
 	}
 	return out, rows.Err()
 }
+
+// UpsertRepositoryAsset inserts or merges a code-audit repository asset keyed by
+// URL (type='repository'). extra is merged into the existing JSONB so repeated
+// ingest runs can add commit/language metadata without clobbering earlier keys.
+// task_ids accumulates every task that audited the repository.
+func (d *DB) UpsertRepositoryAsset(url string, extra map[string]any, taskID int64) (int64, error) {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return 0, errors.New("repository url 不能为空")
+	}
+	if extra == nil {
+		extra = map[string]any{}
+	}
+	rawExtra, err := json.Marshal(extra)
+	if err != nil {
+		return 0, fmt.Errorf("encode repository extra: %w", err)
+	}
+	var id int64
+	err = d.QueryRow(`
+INSERT INTO assets(type, url, task_ids, extra, last_seen)
+VALUES ('repository', $1,
+        CASE WHEN $2::bigint > 0 THEN ARRAY[$2::bigint]::bigint[] ELSE '{}'::bigint[] END,
+        $3::jsonb, now())
+ON CONFLICT (url) WHERE type = 'repository' DO UPDATE SET
+    task_ids = (SELECT ARRAY(SELECT DISTINCT unnest(assets.task_ids || EXCLUDED.task_ids))),
+    extra    = assets.extra || EXCLUDED.extra,
+    last_seen = now(),
+    updated_at = now()
+RETURNING id`, url, taskID, string(rawExtra)).Scan(&id)
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}

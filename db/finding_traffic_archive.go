@@ -80,6 +80,25 @@ func normalizeArchivedFindingVersions(raw json.RawMessage) (json.RawMessage, err
 				row[key] = 0
 			}
 		}
+		// Archives written before the Code Audit schema lack these columns.
+		// json_populate_recordset would map the missing keys to NULL, which the
+		// new NOT NULL columns reject, so backfill the SQL defaults here.
+		for key, fallback := range map[string]any{
+			"cwe_id":        "",
+			"code_path":     "",
+			"code_line":     0,
+			"code_symbol":   "",
+			"confidence":    0,
+			"verification":  "unverified",
+			"dedupe_key":    "",
+			"code_evidence": map[string]any{},
+			"audit_round":   0,
+			"audit_phase":   "",
+		} {
+			if row[key] == nil {
+				row[key] = fallback
+			}
+		}
 	}
 	return json.Marshal(rows)
 }

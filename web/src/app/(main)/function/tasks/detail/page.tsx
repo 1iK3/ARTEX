@@ -22,6 +22,7 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Popover,
@@ -40,6 +41,7 @@ import { api } from "@/lib/api";
 import type { LLMProfile, Task } from "@/lib/types";
 
 import { AssetsTab } from "./_tabs/assets-tab";
+import { CodeAuditTab } from "./_tabs/audit-tab";
 import { BroadcastTab } from "./_tabs/broadcast-tab";
 import { CoverageGraphTab } from "./_tabs/coverage-graph-tab";
 import { FindingsTab } from "./_tabs/findings-tab";
@@ -51,6 +53,7 @@ import { RetestsTab } from "./_tabs/retests-tab";
 import { SessionsTab } from "./_tabs/sessions-tab";
 
 const TABS = [
+  { value: "audit", label: "代码审计" },
   { value: "sessions", label: "会话" },
   { value: "overview", label: "总览" },
   { value: "graph", label: "探索链路" },
@@ -300,6 +303,14 @@ function TaskDetailInner() {
     }
   }
 
+  // 首次拿到任务时按模式选择默认页签；后续轮询不覆盖用户选择。
+  const initialTabTaskRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (!task || initialTabTaskRef.current === task.id) return;
+    initialTabTaskRef.current = task.id;
+    setTab(task.task_mode === "code_audit" ? "audit" : "sessions");
+  }, [task]);
+
   if (!task) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 p-10 text-center">
@@ -315,6 +326,9 @@ function TaskDetailInner() {
     );
   }
 
+  const codeAudit = task.task_mode === "code_audit";
+  const codeAuditTabValues = new Set(["audit", "sessions", "overview", "findings", "report"]);
+  const visibleTabs = codeAudit ? TABS.filter((item) => codeAuditTabValues.has(item.value)) : TABS.filter((item) => item.value !== "audit");
   const completed = task.status === "done";
   const terminal = ["done", "failed", "timeout"].includes(task.status);
   const archiveLifecycleEligible = terminal || paused || task.status === "paused";
@@ -364,6 +378,9 @@ function TaskDetailInner() {
           <code className="hidden rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground sm:inline">
             {task.id}
           </code>
+          <Badge variant="outline" className="shrink-0 text-[10px]">
+            {codeAudit ? "代码审计" : "渗透测试"}
+          </Badge>
           <Separator orientation="vertical" className="mx-1 hidden h-4 sm:block" />
           <TaskLLMControl task={task} profiles={profiles} onUpdated={load} />
           <StatusBadge domain={terminal ? "task" : "engine"} value={terminal ? task.status : engineMode} dot />
@@ -401,7 +418,7 @@ function TaskDetailInner() {
         {/* Tabs */}
         <div className="no-scrollbar min-w-0 overflow-x-auto">
           <TabsList variant="default" className="min-w-max">
-            {TABS.map((t) => (
+            {visibleTabs.map((t) => (
               <TabsTrigger key={t.value} value={t.value}>
                 {t.label}
                 {t.value === "intercept" && interceptPendingCount > 0 && (
@@ -417,6 +434,11 @@ function TaskDetailInner() {
 
       {/* Tab content */}
       <div className="flex-1 p-4 lg:p-6">
+        {codeAudit && (
+          <TabsContent value="audit" className="mt-0">
+            <CodeAuditTab taskId={id} onOpenReport={() => setTab("report")} />
+          </TabsContent>
+        )}
         <TabsContent value="sessions" className="mt-0">
           <SessionsTab taskId={id} />
         </TabsContent>
@@ -445,7 +467,7 @@ function TaskDetailInner() {
           <InterceptTab taskId={id} />
         </TabsContent>
         <TabsContent value="report" className="mt-0">
-          <ReportTab taskId={id} />
+          <ReportTab taskId={id} taskMode={task.task_mode} />
         </TabsContent>
       </div>
     </Tabs>

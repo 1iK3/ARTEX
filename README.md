@@ -461,6 +461,23 @@ flowchart TB
 
 ---
 
+## 代码审计（code_audit 任务模式）
+
+ARTEX 内置原生静态代码审计能力：在原有双图/planner/worker 调度上增加确定性“审计导演”，对 Git 仓库、服务器本地目录或上传压缩包执行全量、深度、可回溯的白盒漏洞挖掘。
+
+- **输入**：Git URL / 本地目录 / zip；本地目录需通过 `ARTEX_AUDIT_LOCAL_ROOTS` 授权。
+- **分析引擎**：CodeGraph（符号/调用链/源码，主底座）、CodeQL（数据流/SARIF，可选）、Joern（CPG/CFG，可选）、只读源码兜底。
+- **审计流程**：源码快照 → 画像/攻击面 → CWE sink 预扫描 + 多引擎查询 → worker 复核 → 覆盖度/质量门禁 → 确定性 Markdown/JSON 报告。
+- **结构化证据**：CWE、位置、source→sink trace、sanitizer、S0–S5 语义链、可达性、引擎命中、PoC artifact（不执行）。
+- **安全边界**：静态阶段不执行目标代码/构建/测试；审计 worker 无 Bash/网络/源码写入工具；CodeQL 仅 `build-mode=none` 或预构建 DB；Joern 只解析。
+- **界面**：任务创建支持代码审计模式；任务详情新增“代码审计”页签（引擎状态、阶段、覆盖度、门禁、候选、报告）；漏洞详情展示结构化代码证据。
+
+详细安装（CodeGraph/CodeQL/Joern、query packs、本地根目录）、API、阅读方式和当前限制见 [`docs/code-audit-usage.md`](docs/code-audit-usage.md)。
+
+> 当前版本为静态审计闭环，多轮聚焦补扫、动态部署/PoC 执行和完整归档支持仍在后续计划中；引擎不可用/不支持的语言会作为覆盖缺口写入报告，不会静默忽略。
+
+---
+
 ## 交流群
 
 扫码关注微信公众号 **SecSentry**，在公众号后台私信即可入群交流。

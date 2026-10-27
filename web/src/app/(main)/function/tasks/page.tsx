@@ -117,12 +117,19 @@ import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { type SortDirection, useStoredSortPreference } from "@/lib/sort-preference";
 import type {
   AssetInterceptRuleInput,
+  AuditCapabilities,
+  AuditConfig,
+  AuditCWEScope,
+  AuditDepth,
+  AuditEngineChoice,
+  AuditSourceType,
   ChatAttachment,
   Company,
   DeleteTaskOptions,
@@ -132,6 +139,7 @@ import type {
   TaskArchive,
   TaskArchiveState,
   TaskCategory,
+  TaskMode,
   TaskStatus,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -1192,6 +1200,11 @@ const TaskRow = React.memo(function TaskRow({
       <TableCell className="font-medium">
         <div className="flex max-w-xs items-center gap-2">
           <TaskNameEditor task={task} onRename={onRename} />
+          {task.task_mode === "code_audit" && (
+            <Badge variant="outline" className="h-4 shrink-0 px-1.5 text-[10px]" title="代码审计任务">
+              代码审计
+            </Badge>
+          )}
           {task.active && <StarIcon className="size-4 shrink-0 fill-amber-400 text-amber-400" />}
           {taskIsPinned(task) && <PinIcon className="text-primary size-4 shrink-0" aria-label="已置顶" />}
         </div>
@@ -3060,6 +3073,426 @@ function CategoryManagementSheet({
   );
 }
 
+const AUDIT_SOURCE_LABELS: Record<AuditSourceType, string> = {
+  git: "Git 仓库",
+  local: "本地目录",
+  zip: "上传压缩包",
+};
+
+const AUDIT_DEPTH_LABELS: Record<AuditDepth, string> = {
+  quick: "快速（quick）",
+  standard: "标准（standard）",
+  deep: "深度（deep）",
+};
+
+const AUDIT_CWE_SCOPE_LABELS: Record<AuditCWEScope, string> = {
+  core: "核心 CWE",
+  full: "全量 CWE",
+  explicit: "指定 CWE",
+};
+
+const AUDIT_DEFAULT_ROUNDS: Record<AuditDepth, number> = { quick: 1, standard: 3, deep: 5 };
+
+// 逗号/空白分隔的输入统一成去重列表。
+function splitList(raw: string): string[] {
+  return [...new Set(raw.split(/[,\s，]+/).map((item) => item.trim()).filter(Boolean))];
+}
+
+// CWE 输入允许简写 89，统一规范成后端要求的 CWE-89。
+function normalizeCWEList(raw: string): string[] {
+  return [
+    ...new Set(
+      splitList(raw).map((item) => {
+        const upper = item.toUpperCase();
+        return /^\d+$/.test(upper) ? `CWE-${upper}` : upper;
+      }),
+    ),
+  ];
+}
+
+function newDraftID(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `d${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function AuditEngineReady({
+  label,
+  capability,
+  loading,
+  required,
+}: {
+  label: string;
+  capability?: { available?: boolean; version?: string; path?: string };
+  loading: boolean;
+  required?: boolean;
+}) {
+  let text = loading ? "探测中…" : capability?.available ? "可用" : "未检测到";
+  if (!loading && capability?.available && capability.version) text = capability.version;
+  const available = Boolean(capability?.available);
+  const locationHint = capability?.path ?? "PATH 中未找到可执行文件";
+  return (
+    <div className="flex items-start justify-between gap-2 rounded-md border px-2.5 py-2">
+      <div className="min-w-0">
+        <div className="flex items-center gap-1.5 text-xs font-medium">
+          <span className={cn("size-1.5 rounded-full", available ? "bg-emerald-500" : "bg-muted-foreground/50")} />
+          {label}
+          {required && <span className="text-[10px] font-normal text-muted-foreground">深度必需</span>}
+        </div>
+        <p className="mt-0.5 truncate text-[11px] text-muted-foreground" title={capability?.path}>
+          {locationHint}
+        </p>
+      </div>
+      <Badge variant={available ? "secondary" : "outline"} className="shrink-0 px-1.5 text-[10px]">
+        {text}
+      </Badge>
+    </div>
+  );
+}
+
+function AuditSourceFields({
+  sourceType,
+  onSourceTypeChange,
+  repoURL,
+  onRepoURLChange,
+  repoRef,
+  onRepoRefChange,
+  localPath,
+  onLocalPathChange,
+  zipFile,
+  zipUploaded,
+  zipUploading,
+  onPickZip,
+  onClearZip,
+  capabilities,
+  capabilitiesLoading,
+  onReloadCapabilities,
+  depth,
+  onDepthChange,
+  cweScope,
+  onCweScopeChange,
+  cweIDs,
+  onCweIDsChange,
+  languages,
+  onLanguagesChange,
+  maxRounds,
+  onMaxRoundsChange,
+  codegraph,
+  onCodegraphChange,
+  codeql,
+  onCodeqlChange,
+  joern,
+  onJoernChange,
+  includeTests,
+  onIncludeTestsChange,
+  includeVendor,
+  onIncludeVendorChange,
+}: {
+  sourceType: AuditSourceType;
+  onSourceTypeChange: (value: AuditSourceType) => void;
+  repoURL: string;
+  onRepoURLChange: (value: string) => void;
+  repoRef: string;
+  onRepoRefChange: (value: string) => void;
+  localPath: string;
+  onLocalPathChange: (value: string) => void;
+  zipFile: File | null;
+  zipUploaded: boolean;
+  zipUploading: boolean;
+  onPickZip: () => void;
+  onClearZip: () => void;
+  capabilities: AuditCapabilities | null;
+  capabilitiesLoading: boolean;
+  onReloadCapabilities: () => void;
+  depth: AuditDepth;
+  onDepthChange: (value: AuditDepth) => void;
+  cweScope: AuditCWEScope;
+  onCweScopeChange: (value: AuditCWEScope) => void;
+  cweIDs: string;
+  onCweIDsChange: (value: string) => void;
+  languages: string;
+  onLanguagesChange: (value: string) => void;
+  maxRounds: string;
+  onMaxRoundsChange: (value: string) => void;
+  codegraph: AuditEngineChoice;
+  onCodegraphChange: (value: AuditEngineChoice) => void;
+  codeql: "auto" | "off";
+  onCodeqlChange: (value: "auto" | "off") => void;
+  joern: "auto" | "off";
+  onJoernChange: (value: "auto" | "off") => void;
+  includeTests: boolean;
+  onIncludeTestsChange: (value: boolean) => void;
+  includeVendor: boolean;
+  onIncludeVendorChange: (value: boolean) => void;
+}) {
+  const codegraphReady = Boolean(capabilities?.codegraph?.available);
+  const codeqlReady = Boolean(capabilities?.codeql?.available);
+  const joernReady = Boolean(capabilities?.joern?.available);
+  const localRoots = capabilities?.local_roots;
+  const localRootNames = localRoots?.basenames ?? [];
+  const roundsHint = `留空按深度默认：快速 ${AUDIT_DEFAULT_ROUNDS.quick} / 标准 ${AUDIT_DEFAULT_ROUNDS.standard} / 深度 ${AUDIT_DEFAULT_ROUNDS.deep} 轮`;
+  const maxRoundsLimit = capabilities?.limits?.max_rounds ?? 10;
+  const missingOptional = [
+    !codeqlReady ? "CodeQL" : "",
+    !joernReady ? "Joern" : "",
+  ].filter(Boolean);
+  const sourceKindNote =
+    sourceType === "git"
+      ? "支持 https / ssh 仓库；不要填写带用户名密码的地址，私有仓库使用服务端 SSH agent。"
+      : sourceType === "local"
+        ? `路径必须在服务端允许的本地审计根目录下${localRootNames.length > 0 ? `（${localRootNames.join("、")}）` : "（当前未配置允许根目录）"}。`
+        : "压缩包会上传到服务端 staging 草稿，创建任务只携带 draft id；该草稿目录内只能有一个文件。";
+
+  return (
+    <div className="grid gap-4 rounded-xl border bg-muted/15 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-sm font-medium">源码来源</div>
+        <Button type="button" size="sm" variant="ghost" onClick={onReloadCapabilities} disabled={capabilitiesLoading}>
+          {capabilitiesLoading ? <Loader2Icon className="animate-spin" /> : <SearchIcon />}
+          重新探测引擎
+        </Button>
+      </div>
+      <ToggleGroup
+        type="single"
+        variant="outline"
+        size="sm"
+        value={sourceType}
+        onValueChange={(value) => {
+          if (value === "git" || value === "local" || value === "zip") onSourceTypeChange(value);
+        }}
+      >
+        <ToggleGroupItem value="git">{AUDIT_SOURCE_LABELS.git}</ToggleGroupItem>
+        <ToggleGroupItem value="local">{AUDIT_SOURCE_LABELS.local}</ToggleGroupItem>
+        <ToggleGroupItem value="zip">{AUDIT_SOURCE_LABELS.zip}</ToggleGroupItem>
+      </ToggleGroup>
+
+      {sourceType === "git" && (
+        <div className="grid gap-3">
+          <Field>
+            <FieldLabel htmlFor="audit-repo-url">仓库地址</FieldLabel>
+            <Input
+              id="audit-repo-url"
+              placeholder="https://github.com/org/repo.git"
+              value={repoURL}
+              onChange={(event) => onRepoURLChange(event.target.value)}
+            />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="audit-repo-ref">分支 / 标签 / Commit（可选）</FieldLabel>
+            <Input
+              id="audit-repo-ref"
+              placeholder="留空使用仓库默认分支"
+              value={repoRef}
+              onChange={(event) => onRepoRefChange(event.target.value)}
+            />
+          </Field>
+        </div>
+      )}
+
+      {sourceType === "local" && (
+        <Field>
+          <FieldLabel htmlFor="audit-local-path">本地目录</FieldLabel>
+          <Input
+            id="audit-local-path"
+            placeholder={localRootNames[0] ? `${localRootNames[0]}/your-repo` : "服务端允许根目录下的绝对路径"}
+            value={localPath}
+            onChange={(event) => onLocalPathChange(event.target.value)}
+          />
+          <FieldDescription>
+            {localRootNames.length > 0
+              ? `允许根目录：${localRootNames.join("、")}（仅显示服务端 basename）`
+              : "服务端未配置本地审计允许根目录，当前无法提交本地目录任务。"}
+          </FieldDescription>
+        </Field>
+      )}
+
+      {sourceType === "zip" && (
+        <Field>
+          <FieldLabel>源码压缩包</FieldLabel>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="button" variant="outline" size="sm" onClick={onPickZip} disabled={zipUploading}>
+              {zipUploading ? <Loader2Icon className="animate-spin" /> : <PaperclipIcon />}
+              {zipUploading ? "上传中" : zipUploaded ? "重新选择压缩包" : "选择压缩包"}
+            </Button>
+            {zipFile && (
+              <Badge variant={zipUploaded ? "secondary" : "outline"} className="max-w-full gap-1">
+                <span className="truncate">{zipFile.name}</span>
+                <span className="text-muted-foreground">{fmtBytes(zipFile.size)}</span>
+                <button
+                  type="button"
+                  className="rounded-full p-0.5 hover:bg-background/70"
+                  aria-label="移除已选压缩包"
+                  onClick={onClearZip}
+                >
+                  <XIcon className="size-3" />
+                </button>
+              </Badge>
+            )}
+            {zipUploaded && <span className="text-xs text-emerald-600 dark:text-emerald-400">已上传至暂存区</span>}
+          </div>
+          <FieldDescription>{sourceKindNote}</FieldDescription>
+        </Field>
+      )}
+      {sourceType === "git" && <p className="text-xs text-muted-foreground">{sourceKindNote}</p>}
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field>
+          <FieldLabel>审计深度</FieldLabel>
+          <Select value={depth} onValueChange={(value) => onDepthChange(value as AuditDepth)}>
+            <SelectTrigger className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {(Object.keys(AUDIT_DEPTH_LABELS) as AuditDepth[]).map((value) => (
+                <SelectItem key={value} value={value}>
+                  {AUDIT_DEPTH_LABELS[value]}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+        <Field>
+          <FieldLabel>CWE 范围</FieldLabel>
+          <Select value={cweScope} onValueChange={(value) => onCweScopeChange(value as AuditCWEScope)}>
+            <SelectTrigger className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {(Object.keys(AUDIT_CWE_SCOPE_LABELS) as AuditCWEScope[]).map((value) => (
+                <SelectItem key={value} value={value}>
+                  {AUDIT_CWE_SCOPE_LABELS[value]}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+      </div>
+
+      {cweScope === "explicit" && (
+        <Field>
+          <FieldLabel htmlFor="audit-cwe-ids">CWE 编号</FieldLabel>
+          <Input
+            id="audit-cwe-ids"
+            placeholder="CWE-89, CWE-79, 22（支持逗号分隔，纯数字自动补 CWE-）"
+            value={cweIDs}
+            onChange={(event) => onCweIDsChange(event.target.value)}
+          />
+        </Field>
+      )}
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field>
+          <FieldLabel htmlFor="audit-languages">语言（可选）</FieldLabel>
+          <Input
+            id="audit-languages"
+            placeholder="留空自动识别；可填 java, go, python"
+            value={languages}
+            onChange={(event) => onLanguagesChange(event.target.value)}
+          />
+        </Field>
+        <Field>
+          <FieldLabel htmlFor="audit-max-rounds">最大轮次（可选）</FieldLabel>
+          <Input
+            id="audit-max-rounds"
+            type="number"
+            min={1}
+            max={maxRoundsLimit}
+            placeholder={`自动（${AUDIT_DEFAULT_ROUNDS[depth]} 轮）`}
+            value={maxRounds}
+            onChange={(event) => onMaxRoundsChange(event.target.value)}
+          />
+          <FieldDescription>{roundsHint}，上限 {maxRoundsLimit} 轮。</FieldDescription>
+        </Field>
+      </div>
+
+      <div className="grid gap-2">
+        <div className="text-xs font-medium">分析引擎</div>
+        <div className="grid gap-2 sm:grid-cols-3">
+          <Field>
+            <FieldLabel className="text-xs">CodeGraph</FieldLabel>
+            <Select value={codegraph} onValueChange={(value) => onCodegraphChange(value as AuditEngineChoice)}>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="required">必需</SelectItem>
+                <SelectItem value="auto">自动</SelectItem>
+                <SelectItem value="off" disabled={depth === "deep"}>
+                  关闭{depth === "deep" ? "（深度必需）" : ""}
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+          <Field>
+            <FieldLabel className="text-xs">CodeQL</FieldLabel>
+            <Select value={codeql} onValueChange={(value) => onCodeqlChange(value as "auto" | "off")}>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">自动</SelectItem>
+                <SelectItem value="off">关闭</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+          <Field>
+            <FieldLabel className="text-xs">Joern</FieldLabel>
+            <Select value={joern} onValueChange={(value) => onJoernChange(value as "auto" | "off")}>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">自动</SelectItem>
+                <SelectItem value="off">关闭</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
+        </div>
+        <div className="grid gap-2 sm:grid-cols-3">
+          <AuditEngineReady
+            label="CodeGraph"
+            capability={capabilities?.codegraph}
+            loading={capabilitiesLoading}
+            required={depth === "deep"}
+          />
+          <AuditEngineReady label="CodeQL" capability={capabilities?.codeql} loading={capabilitiesLoading} />
+          <AuditEngineReady label="Joern" capability={capabilities?.joern} loading={capabilitiesLoading} />
+        </div>
+        {depth === "deep" && capabilities && !codegraphReady && (
+          <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-700 dark:text-amber-300">
+            深度审计依赖 CodeGraph，但当前未探测到可用二进制。任务可以创建，但审计可能因缺少结构分析能力而失败或降级。
+          </p>
+        )}
+        {capabilities && missingOptional.length > 0 && (
+          <p className="text-xs text-muted-foreground">
+            {missingOptional.join(" / ")} 未检测到；可选引擎会自动跳过，不影响任务创建。
+          </p>
+        )}
+        {!capabilities && !capabilitiesLoading && (
+          <p className="text-xs text-muted-foreground">引擎能力探测失败，配置仍会提交，由后端在执行前校验。</p>
+        )}
+      </div>
+
+      <div className="flex flex-wrap gap-4 border-t pt-3">
+        <label htmlFor="audit-include-tests" className="flex items-center gap-2 text-sm">
+          <Checkbox
+            id="audit-include-tests"
+            checked={includeTests}
+            onCheckedChange={(value) => onIncludeTestsChange(value === true)}
+          />
+          包含测试代码
+        </label>
+        <label htmlFor="audit-include-vendor" className="flex items-center gap-2 text-sm">
+          <Checkbox
+            id="audit-include-vendor"
+            checked={includeVendor}
+            onCheckedChange={(value) => onIncludeVendorChange(value === true)}
+          />
+          包含第三方 / vendor 目录
+        </label>
+      </div>
+    </div>
+  );
+}
+
 function CreateTaskSheet({
   tasks,
   categories,
@@ -3072,6 +3505,7 @@ function CreateTaskSheet({
   onCategoriesChanged: () => void;
 }) {
   const [open, setOpen] = React.useState(false);
+  const [taskMode, setTaskMode] = React.useState<TaskMode>("pentest");
   const [name, setName] = React.useState("");
   const [categoryID, setCategoryID] = React.useState<number | undefined>(undefined);
   const [description, setDescription] = React.useState("");
@@ -3094,6 +3528,28 @@ function CreateTaskSheet({
   const draftIdRef = React.useRef<string>("");
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const sheetContentRef = React.useRef<HTMLDivElement>(null);
+  // ---- 代码审计表单 ----
+  const [auditSourceType, setAuditSourceType] = React.useState<AuditSourceType>("git");
+  const [repoURL, setRepoURL] = React.useState("");
+  const [repoRef, setRepoRef] = React.useState("");
+  const [localPath, setLocalPath] = React.useState("");
+  const [auditDepth, setAuditDepth] = React.useState<AuditDepth>("deep");
+  const [cweScope, setCweScope] = React.useState<AuditCWEScope>("core");
+  const [cweIDs, setCweIDs] = React.useState("");
+  const [languages, setLanguages] = React.useState("");
+  const [maxRounds, setMaxRounds] = React.useState("");
+  const [codegraphEngine, setCodegraphEngine] = React.useState<AuditEngineChoice>("required");
+  const [codeqlEngine, setCodeqlEngine] = React.useState<"auto" | "off">("auto");
+  const [joernEngine, setJoernEngine] = React.useState<"auto" | "off">("auto");
+  const [includeTests, setIncludeTests] = React.useState(false);
+  const [includeVendor, setIncludeVendor] = React.useState(false);
+  const [capabilities, setCapabilities] = React.useState<AuditCapabilities | null>(null);
+  const [capabilitiesLoading, setCapabilitiesLoading] = React.useState(false);
+  // zip 上传使用独立 draft id：后端要求该 staging 目录里只能有一个压缩包。
+  const [zipFile, setZipFile] = React.useState<File | null>(null);
+  const [zipUploadID, setZipUploadID] = React.useState("");
+  const [zipUploading, setZipUploading] = React.useState(false);
+  const zipInputRef = React.useRef<HTMLInputElement>(null);
 
   // load LLM profiles once for the create-task profile picker.
   React.useEffect(() => {
@@ -3106,6 +3562,98 @@ function CreateTaskSheet({
       .then(setCompanies)
       .catch(() => setCompanies([]));
   }, []);
+
+  const loadAuditCapabilities = React.useCallback(async () => {
+    setCapabilitiesLoading(true);
+    try {
+      setCapabilities(await api.auditCapabilities());
+    } catch {
+      // 能力探测失败不阻塞创建；页面上会显示“未检测到”。
+      setCapabilities(null);
+    } finally {
+      setCapabilitiesLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (!open) return;
+    void loadAuditCapabilities();
+  }, [open, loadAuditCapabilities]);
+
+  function resetAuditState() {
+    setAuditSourceType("git");
+    setRepoURL("");
+    setRepoRef("");
+    setLocalPath("");
+    setAuditDepth("deep");
+    setCweScope("core");
+    setCweIDs("");
+    setLanguages("");
+    setMaxRounds("");
+    setCodegraphEngine("required");
+    setCodeqlEngine("auto");
+    setJoernEngine("auto");
+    setIncludeTests(false);
+    setIncludeVendor(false);
+    setZipFile(null);
+    setZipUploadID("");
+  }
+
+  function applyAuditConfig(config: AuditConfig) {
+    const sourceType: AuditSourceType = ["git", "local", "zip"].includes(config.source_type)
+      ? config.source_type
+      : "git";
+    const depth: AuditDepth = ["quick", "standard", "deep"].includes(config.depth ?? "") ? config.depth : "deep";
+    const scope: AuditCWEScope = ["core", "full", "explicit"].includes(config.cwe_scope ?? "")
+      ? config.cwe_scope
+      : "core";
+    setAuditSourceType(sourceType);
+    setRepoURL(typeof config.repo_url === "string" ? config.repo_url : "");
+    setRepoRef(typeof config.ref === "string" ? config.ref : "");
+    setLocalPath(typeof config.local_path === "string" ? config.local_path : "");
+    setAuditDepth(depth);
+    setCweScope(scope);
+    setCweIDs(Array.isArray(config.cwe_ids) ? config.cwe_ids.join(", ") : "");
+    setLanguages(Array.isArray(config.languages) ? config.languages.join(", ") : "");
+    setMaxRounds(typeof config.max_rounds === "number" && config.max_rounds > 0 ? String(config.max_rounds) : "");
+    const engines = config.engines ?? {};
+    setCodegraphEngine(engines.codegraph === "auto" || engines.codegraph === "off" ? engines.codegraph : "required");
+    setCodeqlEngine(engines.codeql === "off" ? "off" : "auto");
+    setJoernEngine(engines.joern === "off" ? "off" : "auto");
+    setIncludeTests(Boolean(config.include_tests));
+    setIncludeVendor(Boolean(config.include_vendor));
+    // 模板里的 upload_id 属于旧上传，不能复用；切到 zip 时必须重新选择文件。
+    setZipFile(null);
+    setZipUploadID("");
+    if (sourceType === "zip") setAuditSourceType("zip");
+  }
+
+  function changeDepth(next: AuditDepth) {
+    setAuditDepth(next);
+    if (next === "deep" && codegraphEngine === "off") setCodegraphEngine("required");
+  }
+
+  // pickZip 把单个源码压缩包上传到独立 staging 草稿；创建任务只传 draft id，不暴露绝对路径。
+  async function pickZip(files: FileList | null) {
+    const file = files?.[0];
+    if (!file) return;
+    const uploadID = newDraftID();
+    setZipUploading(true);
+    try {
+      const uploaded = await api.chatUpload("staging", uploadID, [file]);
+      if (!uploaded.attachments.length) throw new Error("上传结果为空");
+      setZipFile(file);
+      setZipUploadID(uploadID);
+      toast.success(`已上传 ${file.name}`);
+    } catch (e) {
+      setZipFile(null);
+      setZipUploadID("");
+      toast.error("压缩包上传失败：" + (e as Error).message);
+    } finally {
+      setZipUploading(false);
+      if (zipInputRef.current) zipInputRef.current.value = "";
+    }
+  }
 
   // pickFiles uploads the chosen files into this draft's staging dir and appends their
   // absolute paths to the description; the task's agents open them by path via Read/Bash.
@@ -3130,7 +3678,49 @@ function CreateTaskSheet({
   }
 
   async function createTask() {
-    if (!description.trim() || !goal.trim()) {
+    const isCodeAudit = taskMode === "code_audit";
+    if (isCodeAudit) {
+      if (!name.trim() && !description.trim()) {
+        toast.error("请填写任务名称或描述");
+        return;
+      }
+      if (auditSourceType === "git" && !repoURL.trim()) {
+        toast.error("请填写 Git 仓库地址");
+        return;
+      }
+      if (auditSourceType === "local" && !localPath.trim()) {
+        toast.error("请填写本地目录");
+        return;
+      }
+      if (auditSourceType === "zip" && (!zipUploadID || zipUploading)) {
+        toast.error(zipUploading ? "压缩包仍在上传中" : "请先上传源码压缩包");
+        return;
+      }
+      if (cweScope === "explicit") {
+        const ids = normalizeCWEList(cweIDs);
+        if (ids.length === 0) {
+          toast.error("选择“指定 CWE”时至少填写一个 CWE 编号");
+          return;
+        }
+        const invalid = ids.find((id) => !/^CWE-\d+$/.test(id));
+        if (invalid) {
+          toast.error(`无效的 CWE 编号：${invalid}（应形如 CWE-89）`);
+          return;
+        }
+      }
+      if (maxRounds.trim()) {
+        const rounds = Number(maxRounds);
+        const upper = capabilities?.limits?.max_rounds ?? 10;
+        if (!Number.isInteger(rounds) || rounds < 1 || rounds > upper) {
+          toast.error(`最大轮次必须是 1-${upper} 的整数`);
+          return;
+        }
+      }
+      if (auditDepth === "deep" && codegraphEngine === "off") {
+        toast.error("深度审计必须启用 CodeGraph");
+        return;
+      }
+    } else if (!description.trim() || !goal.trim()) {
       toast.error("请填写描述与目标");
       return;
     }
@@ -3142,27 +3732,51 @@ function CreateTaskSheet({
     try {
       const timeoutSec = Math.max(0, Math.floor(Number(timeoutMin) || 0)) * 60;
       const heartbeatSec = Math.max(10, Math.floor(Number(heartbeatMin) || 10)) * 60; // 下限 10min，与后端归一一致
+      let audit: AuditConfig | undefined;
+      if (isCodeAudit) {
+        const parsedLanguages = splitList(languages);
+        audit = {
+          source_type: auditSourceType,
+          ...(auditSourceType === "git"
+            ? { repo_url: repoURL.trim(), ...(repoRef.trim() ? { ref: repoRef.trim() } : {}) }
+            : {}),
+          ...(auditSourceType === "local" ? { local_path: localPath.trim() } : {}),
+          ...(auditSourceType === "zip" ? { upload_id: zipUploadID } : {}),
+          depth: auditDepth,
+          cwe_scope: cweScope,
+          ...(cweScope === "explicit" ? { cwe_ids: normalizeCWEList(cweIDs) } : {}),
+          ...(parsedLanguages.length > 0 ? { languages: parsedLanguages } : {}),
+          max_rounds: maxRounds.trim() ? Number(maxRounds) : 0, // 0 = 后端按深度补默认轮次
+          engines: { codegraph: codegraphEngine, codeql: codeqlEngine, joern: joernEngine },
+          budgets: {},
+          include_tests: includeTests,
+          include_vendor: includeVendor,
+        };
+      }
       await api.createTask({
         name: name.trim(),
         categoryId: categoryID,
-        description: description.trim(),
+        description: description.trim() || (isCodeAudit ? name.trim() : ""),
         goal: goal.trim(),
+        taskMode,
+        ...(audit ? { audit } : {}),
         llmProfileIds: llmProfileIDs.map(Number),
-        sourceTaskIds: sourceTaskIDs,
-        companyIds: companyIDs,
+        sourceTaskIds: isCodeAudit ? [] : sourceTaskIDs,
+        companyIds: isCodeAudit ? [] : companyIDs,
         timeoutSeconds: timeoutSec,
-        seedFirstIntent,
+        seedFirstIntent: isCodeAudit ? false : seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
-        coverageEnabled,
-        interceptRules: interceptRules
-          .map((r) => ({ ...r, pattern: r.pattern.trim() }))
-          .filter((r) => r.pattern !== ""),
+        coverageEnabled: isCodeAudit ? false : coverageEnabled,
+        interceptRules: isCodeAudit
+          ? []
+          : interceptRules.map((r) => ({ ...r, pattern: r.pattern.trim() })).filter((r) => r.pattern !== ""),
       });
-      toast.success("任务已创建");
+      toast.success(isCodeAudit ? "代码审计任务已创建" : "任务已创建");
       setName("");
       setCategoryID(undefined);
       setDescription("");
       setGoal("");
+      setTaskMode("pentest");
       setSelectedTemplateID(null);
       setSourceTaskIDs([]);
       setCompanyIDs([]);
@@ -3174,6 +3788,7 @@ function CreateTaskSheet({
       setInterceptRules([]);
       setUploadCount(0);
       draftIdRef.current = "";
+      resetAuditState();
       setOpen(false);
       onCreated();
     } catch (e) {
@@ -3212,19 +3827,47 @@ function CreateTaskSheet({
               selectedTemplateID={selectedTemplateID}
               onSelectedTemplateIDChange={setSelectedTemplateID}
               onApply={(template) => {
+                const nextMode = template.task_mode ?? "pentest";
+                setTaskMode(nextMode);
                 setDescription(template.description);
                 setGoal(template.goal);
                 setCategoryID(template.category_id ?? undefined);
                 setInterceptRules(template.intercept_rules ?? []);
                 setUploadCount(0);
+                if (nextMode === "code_audit" && template.audit_config) {
+                  applyAuditConfig(template.audit_config);
+                }
               }}
               portalContainer={sheetContentRef}
             />
+            <Field>
+              <FieldLabel>任务模式</FieldLabel>
+              <ToggleGroup
+                type="single"
+                variant="outline"
+                value={taskMode}
+                onValueChange={(value) => {
+                  if (value !== "pentest" && value !== "code_audit") return;
+                  setTaskMode(value);
+                  if (value === "code_audit" && !capabilities) void loadAuditCapabilities();
+                }}
+              >
+                <ToggleGroupItem value="pentest" aria-label="渗透测试模式">
+                  渗透测试
+                </ToggleGroupItem>
+                <ToggleGroupItem value="code_audit" aria-label="代码审计模式">
+                  代码审计
+                </ToggleGroupItem>
+              </ToggleGroup>
+              <FieldDescription>
+                渗透测试走动态探索流程；代码审计在源码快照上执行 S0–S11 静态审计流水线。
+              </FieldDescription>
+            </Field>
             <div className="grid gap-2">
               <Label htmlFor="name">名称（可选）</Label>
               <Input
                 id="name"
-                placeholder="给任务起个便于识别的名字，例如：Acme 官网渗透"
+                placeholder={taskMode === "code_audit" ? "例如：订单服务 Java 代码审计" : "给任务起个便于识别的名字，例如：Acme 官网渗透"}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
               />
@@ -3241,83 +3884,154 @@ function CreateTaskSheet({
               <FieldDescription>可选，单个分类；用于任务列表筛选和归档，不影响 Agent 执行。</FieldDescription>
             </Field>
             <div className="grid gap-2">
-              <Label htmlFor="description">描述</Label>
+              <Label htmlFor="description">
+                描述{taskMode === "code_audit" ? "（可选，可与名称二选一）" : ""}
+              </Label>
               <Textarea
                 id="description"
                 className="min-h-32"
-                placeholder="测试对象与背景，例如：测试 example.com 这个站点"
+                placeholder={
+                  taskMode === "code_audit"
+                    ? "审计范围与背景，例如：审计订单服务的鉴权、SQL 查询与反序列化入口"
+                    : "测试对象与背景，例如：测试 example.com 这个站点"
+                }
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
               />
-              {/* 上传文件(可多选):暂存到 drafts/,把绝对路径追加进上方描述,worker 据此 Read/Bash 打开。 */}
-              <div className="flex flex-wrap items-center gap-2">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  multiple
-                  className="hidden"
-                  onChange={(e) => void pickFiles(e.target.files)}
-                />
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={uploading}
-                >
-                  {uploading ? <Loader2Icon className="animate-spin" /> : <PaperclipIcon />}
-                  上传文件
-                </Button>
-                <span className="text-muted-foreground text-xs">
-                  {uploadCount > 0
-                    ? `已上传 ${uploadCount} 个文件，绝对路径已追加到描述末尾（可编辑）`
-                    : "可多选；上传后把文件的绝对路径追加到描述，供 worker 用 Read/Bash 打开"}
-                </span>
-              </div>
+              {/* 上传文件(可多选):暂存到 drafts/,把绝对路径追加进描述,worker 据此 Read/Bash 打开。
+                  代码审计使用下方专用的源码压缩包上传，不把服务器绝对路径写进任务描述。 */}
+              {taskMode === "pentest" && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    className="hidden"
+                    onChange={(e) => void pickFiles(e.target.files)}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={uploading}
+                  >
+                    {uploading ? <Loader2Icon className="animate-spin" /> : <PaperclipIcon />}
+                    上传文件
+                  </Button>
+                  <span className="text-muted-foreground text-xs">
+                    {uploadCount > 0
+                      ? `已上传 ${uploadCount} 个文件，绝对路径已追加到描述末尾（可编辑）`
+                      : "可多选；上传后把文件的绝对路径追加到描述，供 worker 用 Read/Bash 打开"}
+                  </span>
+                </div>
+              )}
             </div>
+            {taskMode === "code_audit" && (
+              <AuditSourceFields
+                sourceType={auditSourceType}
+                onSourceTypeChange={(next) => {
+                  setAuditSourceType(next);
+                  if (next === "zip" && !capabilities) void loadAuditCapabilities();
+                }}
+                repoURL={repoURL}
+                onRepoURLChange={setRepoURL}
+                repoRef={repoRef}
+                onRepoRefChange={setRepoRef}
+                localPath={localPath}
+                onLocalPathChange={setLocalPath}
+                zipFile={zipFile}
+                zipUploaded={Boolean(zipUploadID)}
+                zipUploading={zipUploading}
+                onPickZip={() => zipInputRef.current?.click()}
+                onClearZip={() => {
+                  setZipFile(null);
+                  setZipUploadID("");
+                  if (zipInputRef.current) zipInputRef.current.value = "";
+                }}
+                capabilities={capabilities}
+                capabilitiesLoading={capabilitiesLoading}
+                onReloadCapabilities={() => void loadAuditCapabilities()}
+                depth={auditDepth}
+                onDepthChange={changeDepth}
+                cweScope={cweScope}
+                onCweScopeChange={setCweScope}
+                cweIDs={cweIDs}
+                onCweIDsChange={setCweIDs}
+                languages={languages}
+                onLanguagesChange={setLanguages}
+                maxRounds={maxRounds}
+                onMaxRoundsChange={setMaxRounds}
+                codegraph={codegraphEngine}
+                onCodegraphChange={setCodegraphEngine}
+                codeql={codeqlEngine}
+                onCodeqlChange={setCodeqlEngine}
+                joern={joernEngine}
+                onJoernChange={setJoernEngine}
+                includeTests={includeTests}
+                onIncludeTestsChange={setIncludeTests}
+                includeVendor={includeVendor}
+                onIncludeVendorChange={setIncludeVendor}
+              />
+            )}
+            <input
+              ref={zipInputRef}
+              type="file"
+              accept=".zip,application/zip,application/x-zip-compressed"
+              className="hidden"
+              onChange={(e) => void pickZip(e.target.files)}
+            />
             <div className="grid gap-2">
-              <Label htmlFor="goal">目标</Label>
+              <Label htmlFor="goal">{taskMode === "code_audit" ? "目标（可选）" : "目标"}</Label>
               <Textarea
                 id="goal"
                 className="min-h-32"
-                placeholder="要达成什么，例如：拿下后台管理权限、获取服务器权限"
+                placeholder={
+                  taskMode === "code_audit"
+                    ? "留空由后端生成默认审计目标；也可写明重点模块或风险面"
+                    : "要达成什么，例如：拿下后台管理权限、获取服务器权限"
+                }
                 value={goal}
                 onChange={(e) => setGoal(e.target.value)}
               />
             </div>
-            <Field>
-              <FieldLabel htmlFor="source-tasks">关联任务</FieldLabel>
-              <SourceTaskPicker
-                tasks={tasks}
-                value={sourceTaskIDs}
-                onValueChange={setSourceTaskIDs}
-                portalContainer={sheetContentRef}
-              />
-              <FieldDescription>
-                最多关联 {MAX_SOURCE_TASKS}{" "}
-                个任务。实时只读继承所选任务的持久化黑板、资产范围及相关流量；新任务写入独立黑板。
-              </FieldDescription>
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="task-companies">关联企业资产范围</FieldLabel>
-              <CompanyPicker
-                companies={companies}
-                value={companyIDs}
-                onValueChange={setCompanyIDs}
-                portalContainer={sheetContentRef}
-              />
-              <FieldDescription>
-                创建任务时会将所选企业当前已有资产加入“测试资产”，并将域名、IP、CIDR、ICP 和企业关键词提供给 Agent
-                作为范围上下文；不会自动生成意图或强制改变执行目标。
-              </FieldDescription>
-            </Field>
-            <Field>
-              <FieldLabel htmlFor="task-intercept-rules">任务级资产拦截 / 允许规则（可选）</FieldLabel>
-              <AssetInterceptRulesEditor value={interceptRules} onChange={setInterceptRules} />
-              <FieldDescription>
-                仅对本任务生效，不写入全局规则。判定顺序：先按「拦截」规则（含全局）匹配，命中即禁止测试；未命中且本任务配置了「允许」规则时，须命中某条允许规则才放行，否则同样不允许测试；未配置任何允许规则则不启用白名单。
-              </FieldDescription>
-            </Field>
+            {taskMode === "pentest" && (
+              <>
+                <Field>
+                  <FieldLabel htmlFor="source-tasks">关联任务</FieldLabel>
+                  <SourceTaskPicker
+                    tasks={tasks}
+                    value={sourceTaskIDs}
+                    onValueChange={setSourceTaskIDs}
+                    portalContainer={sheetContentRef}
+                  />
+                  <FieldDescription>
+                    最多关联 {MAX_SOURCE_TASKS}{" "}
+                    个任务。实时只读继承所选任务的持久化黑板、资产范围及相关流量；新任务写入独立黑板。
+                  </FieldDescription>
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="task-companies">关联企业资产范围</FieldLabel>
+                  <CompanyPicker
+                    companies={companies}
+                    value={companyIDs}
+                    onValueChange={setCompanyIDs}
+                    portalContainer={sheetContentRef}
+                  />
+                  <FieldDescription>
+                    创建任务时会将所选企业当前已有资产加入“测试资产”，并将域名、IP、CIDR、ICP 和企业关键词提供给 Agent
+                    作为范围上下文；不会自动生成意图或强制改变执行目标。
+                  </FieldDescription>
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="task-intercept-rules">任务级资产拦截 / 允许规则（可选）</FieldLabel>
+                  <AssetInterceptRulesEditor value={interceptRules} onChange={setInterceptRules} />
+                  <FieldDescription>
+                    仅对本任务生效，不写入全局规则。判定顺序：先按「拦截」规则（含全局）匹配，命中即禁止测试；未命中且本任务配置了「允许」规则时，须命中某条允许规则才放行，否则同样不允许测试；未配置任何允许规则则不启用白名单。
+                  </FieldDescription>
+                </Field>
+              </>
+            )}
             <Field>
               <FieldLabel htmlFor="llm-profiles">LLM 配置链</FieldLabel>
               <TaskLLMProfileChain
@@ -3335,7 +4049,9 @@ function CreateTaskSheet({
               <CollapsibleTrigger className="group flex w-full items-center gap-2 border-t pt-4 text-sm font-medium">
                 <ChevronRightIcon className="text-muted-foreground size-4 transition-transform group-data-[state=open]:rotate-90" />
                 高级设置
-                <span className="text-muted-foreground ml-auto text-xs font-normal">超时 · 心跳 · 首个意图</span>
+                <span className="text-muted-foreground ml-auto text-xs font-normal">
+                  {taskMode === "code_audit" ? "超时" : "超时 · 心跳 · 首个意图"}
+                </span>
               </CollapsibleTrigger>
               <CollapsibleContent className="grid gap-5 pt-5">
                 <div className="grid gap-2">
@@ -3353,50 +4069,54 @@ function CreateTaskSheet({
                     到点后触发优雅收尾（各 agent 写回 + planner 终局判定），任务进入 timeout 终态。
                   </p>
                 </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="heartbeat-min">planner 心跳（分钟）</Label>
-                  <Input
-                    id="heartbeat-min"
-                    type="number"
-                    min={10}
-                    className="w-40"
-                    placeholder="默认 10"
-                    value={heartbeatMin}
-                    onChange={(e) => setHeartbeatMin(e.target.value)}
-                  />
-                  <p className="text-muted-foreground text-xs">
-                    距上轮规划结束/任务开始满该时长且期间无触发，自动触发一轮规划（兜底卡死 + 唤醒去监督在跑的
-                    worker）。下限 10 分钟。
-                  </p>
-                </div>
-                <div className="grid gap-2">
-                  <label htmlFor="seed-first-intent" className="flex items-center gap-2 text-sm">
-                    <Checkbox
-                      id="seed-first-intent"
-                      checked={seedFirstIntent}
-                      onCheckedChange={(v) => setSeedFirstIntent(!!v)}
-                    />
-                    直接下发首个意图（描述+目标）
-                  </label>
-                  <p className="text-muted-foreground text-xs">
-                    开启后创建即把「描述+目标」作为一条意图下发，worker 免等首轮规划直接开跑，跑完再由 planner
-                    接手判定/补充。CTF 等常一个 work 直接解决的场景推荐开启；关闭则走标准的先规划再执行。
-                  </p>
-                </div>
-                <div className="grid gap-2">
-                  <label htmlFor="coverage-enabled" className="flex items-center gap-2 text-sm">
-                    <Checkbox
-                      id="coverage-enabled"
-                      checked={coverageEnabled}
-                      onCheckedChange={(v) => setCoverageEnabled(!!v)}
-                    />
-                    资产覆盖度功能
-                  </label>
-                  <p className="text-muted-foreground text-xs">
-                    默认开启：计算并展示测试覆盖度、态势图显示测试进度、自动累积测试范围。关闭后不再计算/展示覆盖度，
-                    态势图仅展示资产不显示进度，agent 也不再获得范围类工具。关闭不影响「关联企业资产范围」。
-                  </p>
-                </div>
+                {taskMode === "pentest" && (
+                  <>
+                    <div className="grid gap-2">
+                      <Label htmlFor="heartbeat-min">planner 心跳（分钟）</Label>
+                      <Input
+                        id="heartbeat-min"
+                        type="number"
+                        min={10}
+                        className="w-40"
+                        placeholder="默认 10"
+                        value={heartbeatMin}
+                        onChange={(e) => setHeartbeatMin(e.target.value)}
+                      />
+                      <p className="text-muted-foreground text-xs">
+                        距上轮规划结束/任务开始满该时长且期间无触发，自动触发一轮规划（兜底卡死 + 唤醒去监督在跑的
+                        worker）。下限 10 分钟。
+                      </p>
+                    </div>
+                    <div className="grid gap-2">
+                      <label htmlFor="seed-first-intent" className="flex items-center gap-2 text-sm">
+                        <Checkbox
+                          id="seed-first-intent"
+                          checked={seedFirstIntent}
+                          onCheckedChange={(v) => setSeedFirstIntent(!!v)}
+                        />
+                        直接下发首个意图（描述+目标）
+                      </label>
+                      <p className="text-muted-foreground text-xs">
+                        开启后创建即把「描述+目标」作为一条意图下发，worker 免等首轮规划直接开跑，跑完再由 planner
+                        接手判定/补充。CTF 等常一个 work 直接解决的场景推荐开启；关闭则走标准的先规划再执行。
+                      </p>
+                    </div>
+                    <div className="grid gap-2">
+                      <label htmlFor="coverage-enabled" className="flex items-center gap-2 text-sm">
+                        <Checkbox
+                          id="coverage-enabled"
+                          checked={coverageEnabled}
+                          onCheckedChange={(v) => setCoverageEnabled(!!v)}
+                        />
+                        资产覆盖度功能
+                      </label>
+                      <p className="text-muted-foreground text-xs">
+                        默认开启：计算并展示测试覆盖度、态势图显示测试进度、自动累积测试范围。关闭后不再计算/展示覆盖度，
+                        态势图仅展示资产不显示进度，agent 也不再获得范围类工具。关闭不影响「关联企业资产范围」。
+                      </p>
+                    </div>
+                  </>
+                )}
               </CollapsibleContent>
             </Collapsible>
           </div>
@@ -3406,9 +4126,9 @@ function CreateTaskSheet({
           <SheetClose asChild>
             <Button variant="outline">取消</Button>
           </SheetClose>
-          <Button onClick={createTask} disabled={creating || uploading}>
+          <Button onClick={createTask} disabled={creating || uploading || zipUploading}>
             {creating && <Spinner data-icon="inline-start" />}
-            {creating ? "创建中" : "创建"}
+            {creating ? "创建中" : taskMode === "code_audit" ? "创建代码审计任务" : "创建"}
           </Button>
         </SheetFooter>
       </SheetContent>

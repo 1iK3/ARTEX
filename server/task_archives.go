@@ -387,7 +387,7 @@ func (s *Server) loadRestoredTask(taskID int64) {
 	if lifecycle.Paused {
 		s.engine.Pause(id, agent.AbortPausedOnReload)
 	}
-	if !isTerminalStatus(lifecycle.Status) {
+	if !isTerminalStatus(lifecycle.Status) && restored.Mode != pgdb.TaskModeCodeAudit {
 		s.engine.startDeadlineCoordinator(s.ctx, restored)
 	}
 }
@@ -717,7 +717,8 @@ func writeArchiveError(w http.ResponseWriter, err error) {
 	status := http.StatusConflict
 	if errors.Is(err, pgdb.ErrTaskArchiveNotFound) {
 		status = http.StatusNotFound
-	} else if !errors.Is(err, pgdb.ErrTaskArchiveIneligible) &&
+	} else if !errors.Is(err, pgdb.ErrTaskArchiveUnsupported) &&
+		!errors.Is(err, pgdb.ErrTaskArchiveIneligible) &&
 		!errors.Is(err, pgdb.ErrTaskArchiveQueued) &&
 		!errors.Is(err, pgdb.ErrTaskArchiveDependent) &&
 		!errors.Is(err, pgdb.ErrTaskArchiveState) &&

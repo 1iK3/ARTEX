@@ -34,6 +34,18 @@ type DBFinding struct {
 	Report          string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
 	CreatedAt       time.Time
 	TaskDescription string // populated via LEFT JOIN on tasks
+
+	// Code-audit evidence. Empty/unverified for pentest findings.
+	CWEID        string
+	CodePath     string
+	CodeLine     int
+	CodeSymbol   string
+	Confidence   float64
+	Verification string
+	DedupeKey    string
+	CodeEvidence json.RawMessage
+	AuditRound   int
+	AuditPhase   string
 }
 
 // Finding triage states (findings.status).
@@ -105,7 +117,9 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.name, ''), f.severity, f.summary,
 	       f.evidence, f.worker, f.asset_ids, COALESCE(f.status, 'pending'), f.created_at,
 	       COALESCE(t.description, '') AS task_description, f.evidence_version, f.report_evidence_version,
- (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id)`
+ (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id),
+ f.cwe_id, f.code_path, f.code_line, f.code_symbol, f.confidence, f.verification,
+ f.dedupe_key, f.code_evidence, f.audit_round, f.audit_phase`
 
 // scanFindings materializes rows selected via findingSelectCols.
 func scanFindings(rows interface {
@@ -117,11 +131,16 @@ func scanFindings(rows interface {
 	for rows.Next() {
 		f := &DBFinding{}
 		var aidsJSON string
+		var codeEvidence []byte
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
-			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount); err != nil {
+			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription,
+			&f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
+			&f.CWEID, &f.CodePath, &f.CodeLine, &f.CodeSymbol, &f.Confidence, &f.Verification,
+			&f.DedupeKey, &codeEvidence, &f.AuditRound, &f.AuditPhase); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
+		f.CodeEvidence = json.RawMessage(codeEvidence)
 		out = append(out, f)
 	}
 	return out, rows.Err()
@@ -509,12 +528,16 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 	for rows.Next() {
 		f := &DBFinding{}
 		var aidsJSON string
+		var codeEvidence []byte
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report); err != nil {
+			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
+			&f.CWEID, &f.CodePath, &f.CodeLine, &f.CodeSymbol, &f.Confidence, &f.Verification,
+			&f.DedupeKey, &codeEvidence, &f.AuditRound, &f.AuditPhase, &f.Report); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
+		f.CodeEvidence = json.RawMessage(codeEvidence)
 		out = append(out, f)
 	}
 	return out, rows.Err()
@@ -633,13 +656,16 @@ func (d *DB) FindingStats() (*FindingStats, error) {
 func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 	f := &DBFinding{}
 	var aidsJSON string
+	var codeEvidence []byte
 	err := d.QueryRow(`SELECT `+findingSelectCols+`, COALESCE(f.report, '')
 		FROM findings f
 		LEFT JOIN tasks t ON f.task_id = t.id
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report)
+		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount,
+		&f.CWEID, &f.CodePath, &f.CodeLine, &f.CodeSymbol, &f.Confidence, &f.Verification,
+		&f.DedupeKey, &codeEvidence, &f.AuditRound, &f.AuditPhase, &f.Report)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -647,6 +673,7 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
+	f.CodeEvidence = json.RawMessage(codeEvidence)
 	return f, nil
 }
 

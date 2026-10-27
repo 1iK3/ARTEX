@@ -41,11 +41,15 @@ func (d *DB) CompleteTaskArchive(
 		return err
 	}
 	var taskID, expID int64
-	var state string
-	if err := tx.QueryRow(`SELECT archive.task_id,task.exploration_id,archive.state
+	var state, mode string
+	if err := tx.QueryRow(`SELECT archive.task_id,task.exploration_id,archive.state,
+ COALESCE(task.task_mode,'pentest')
 FROM task_archives archive JOIN tasks task ON task.id=archive.task_id
-WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID, &state); err != nil {
+WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID, &state, &mode); err != nil {
 		return err
+	}
+	if mode == TaskModeCodeAudit {
+		return fmt.Errorf("%w: task %d", ErrTaskArchiveUnsupported, taskID)
 	}
 	if state != Archiving || taskID != snapshot.TaskID || expID != snapshot.ExplorationID {
 		return fmt.Errorf("%w: archive snapshot identity/state mismatch", ErrTaskArchiveState)
@@ -533,6 +537,9 @@ func findArchiveAssetNaturalID(tx *sql.Tx, row map[string]any) (int64, bool, err
 		}
 	case "endpoint":
 		query, args = `SELECT id FROM assets WHERE type='endpoint' AND url=$1 AND method=$2`, []any{stringValue("url"), stringValue("method")}
+	case "repository":
+		// Repository identity is the URL, matching uq_assets_repository.
+		query, args = `SELECT id FROM assets WHERE type='repository' AND url=$1`, []any{stringValue("url")}
 	default:
 		return 0, false, fmt.Errorf("unsupported archived asset type %q", typeName)
 	}

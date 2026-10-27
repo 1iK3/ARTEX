@@ -33,6 +33,8 @@ type TaskTemplate struct {
 	Goal           string                   `json:"goal"`
 	CategoryID     *int64                   `json:"category_id"`
 	InterceptRules []TaskInterceptRuleInput `json:"intercept_rules"`
+	Mode           string                   `json:"task_mode"`
+	AuditConfig    json.RawMessage          `json:"audit_config"`
 	CreatedAt      time.Time                `json:"created_at"`
 	UpdatedAt      time.Time                `json:"updated_at"`
 }
@@ -44,11 +46,13 @@ type TaskTemplateInput struct {
 	Goal           string
 	CategoryID     *int64
 	InterceptRules []TaskInterceptRuleInput
+	Mode           string
+	AuditConfig    json.RawMessage
 }
 
 // TaskTemplatePatch changes only fields flagged as set. Name/Description/Goal use
-// non-nil pointers; CategoryID/InterceptRules use explicit Set flags (so a nil
-// CategoryID can mean "clear" when SetCategoryID is true).
+// non-nil pointers; CategoryID/InterceptRules/Mode/AuditConfig use explicit Set
+// flags (so a nil CategoryID can mean "clear" when SetCategoryID is true).
 type TaskTemplatePatch struct {
 	Name              *string
 	Description       *string
@@ -57,14 +61,19 @@ type TaskTemplatePatch struct {
 	SetCategoryID     bool
 	InterceptRules    []TaskInterceptRuleInput
 	SetInterceptRules bool
+	Mode              *string
+	AuditConfig       json.RawMessage
+	SetAuditConfig    bool
 }
 
-const taskTemplateCols = `id, name, nkey, description, goal, category_id, intercept_rules, created_at, updated_at`
+const taskTemplateCols = `id, name, nkey, description, goal, category_id, intercept_rules,
+COALESCE(task_mode,'pentest'), COALESCE(audit_config,'{}'::jsonb), created_at, updated_at`
 
 func scanTaskTemplate(row interface{ Scan(...any) error }) (TaskTemplate, error) {
 	var t TaskTemplate
-	var rulesRaw []byte
-	if err := row.Scan(&t.ID, &t.Name, &t.NKey, &t.Description, &t.Goal, &t.CategoryID, &rulesRaw, &t.CreatedAt, &t.UpdatedAt); err != nil {
+	var rulesRaw, auditRaw []byte
+	if err := row.Scan(&t.ID, &t.Name, &t.NKey, &t.Description, &t.Goal, &t.CategoryID, &rulesRaw,
+		&t.Mode, &auditRaw, &t.CreatedAt, &t.UpdatedAt); err != nil {
 		return t, err
 	}
 	t.InterceptRules = []TaskInterceptRuleInput{}
@@ -76,7 +85,47 @@ func scanTaskTemplate(row interface{ Scan(...any) error }) (TaskTemplate, error)
 			t.InterceptRules = []TaskInterceptRuleInput{}
 		}
 	}
+	if t.Mode == "" {
+		t.Mode = TaskModePentest
+	}
+	t.AuditConfig = cloneRawJSON(auditRaw)
+	if len(t.AuditConfig) == 0 {
+		t.AuditConfig = json.RawMessage(`{}`)
+	}
 	return t, nil
+}
+
+// normalizeTaskTemplateMode defaults an empty mode to pentest and rejects
+// unknown modes. allowEmpty is true for create/update payloads, false for PATCH
+// (where an explicitly empty mode is an error).
+func normalizeTaskTemplateMode(mode string, allowEmpty bool) (string, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		if allowEmpty {
+			return TaskModePentest, nil
+		}
+		return "", fmt.Errorf("%w: task_mode is required", ErrTaskTemplateInvalid)
+	}
+	if !ValidTaskMode(mode) {
+		return "", fmt.Errorf("%w: invalid task_mode %q", ErrTaskTemplateInvalid, mode)
+	}
+	return mode, nil
+}
+
+// normalizeTemplateAuditConfig defaults an empty/null config to {} and rejects
+// non-object JSON. Audit semantics are validated by the caller (server layer).
+func normalizeTemplateAuditConfig(raw json.RawMessage) (json.RawMessage, error) {
+	trimmed := []byte(strings.TrimSpace(string(raw)))
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return json.RawMessage(`{}`), nil
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &obj); err != nil {
+		return nil, fmt.Errorf("%w: audit_config must be a JSON object", ErrTaskTemplateInvalid)
+	}
+	out := make(json.RawMessage, len(trimmed))
+	copy(out, trimmed)
+	return out, nil
 }
 
 // marshalTemplateRules serializes a template's rule snapshot to JSONB text,
@@ -98,6 +147,15 @@ func normalizeTaskTemplateInput(in TaskTemplateInput) (TaskTemplateInput, string
 	in.Name = taskTemplateName(in.Name)
 	in.Description = strings.TrimSpace(in.Description)
 	in.Goal = strings.TrimSpace(in.Goal)
+	mode, err := normalizeTaskTemplateMode(in.Mode, true)
+	if err != nil {
+		return in, "", err
+	}
+	auditConfig, err := normalizeTemplateAuditConfig(in.AuditConfig)
+	if err != nil {
+		return in, "", err
+	}
+	in.Mode, in.AuditConfig = mode, auditConfig
 	switch {
 	case in.Name == "":
 		return in, "", fmt.Errorf("%w: name is required", ErrTaskTemplateInvalid)
@@ -116,7 +174,8 @@ func normalizeTaskTemplateInput(in TaskTemplateInput) (TaskTemplateInput, string
 }
 
 func normalizeTaskTemplatePatch(patch TaskTemplatePatch) (TaskTemplatePatch, *string, error) {
-	if patch.Name == nil && patch.Description == nil && patch.Goal == nil && !patch.SetCategoryID && !patch.SetInterceptRules {
+	if patch.Name == nil && patch.Description == nil && patch.Goal == nil && !patch.SetCategoryID &&
+		!patch.SetInterceptRules && patch.Mode == nil && !patch.SetAuditConfig {
 		return patch, nil, fmt.Errorf("%w: no fields supplied", ErrTaskTemplateInvalid)
 	}
 	var nkey *string
@@ -152,6 +211,20 @@ func normalizeTaskTemplatePatch(patch TaskTemplatePatch) (TaskTemplatePatch, *st
 		}
 		patch.Goal = &goal
 	}
+	if patch.Mode != nil {
+		mode, err := normalizeTaskTemplateMode(*patch.Mode, false)
+		if err != nil {
+			return patch, nil, err
+		}
+		patch.Mode = &mode
+	}
+	if patch.SetAuditConfig {
+		auditConfig, err := normalizeTemplateAuditConfig(patch.AuditConfig)
+		if err != nil {
+			return patch, nil, err
+		}
+		patch.AuditConfig = auditConfig
+	}
 	return patch, nkey, nil
 }
 
@@ -171,10 +244,11 @@ func (d *DB) CreateTaskTemplate(in TaskTemplateInput) (*TaskTemplate, error) {
 		return nil, err
 	}
 	t, err := scanTaskTemplate(d.QueryRow(`
-INSERT INTO task_templates(name, nkey, description, goal, category_id, intercept_rules)
-VALUES ($1,$2,$3,$4,$5,$6)
+INSERT INTO task_templates(name, nkey, description, goal, category_id, intercept_rules, task_mode, audit_config)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
 ON CONFLICT (nkey) DO NOTHING
-RETURNING `+taskTemplateCols, in.Name, nkey, in.Description, in.Goal, in.CategoryID, rulesJSON))
+RETURNING `+taskTemplateCols, in.Name, nkey, in.Description, in.Goal, in.CategoryID, rulesJSON,
+		in.Mode, string(in.AuditConfig)))
 	if err == sql.ErrNoRows {
 		return nil, ErrTaskTemplateNameConflict
 	}
@@ -222,6 +296,7 @@ func (d *DB) UpdateTaskTemplate(id int64, in TaskTemplateInput) (*TaskTemplate, 
 	}
 	return d.PatchTaskTemplate(id, TaskTemplatePatch{
 		Name: &in.Name, Description: &in.Description, Goal: &in.Goal,
+		Mode: &in.Mode, AuditConfig: in.AuditConfig, SetAuditConfig: true,
 	})
 }
 
@@ -237,13 +312,19 @@ func (d *DB) PatchTaskTemplate(id int64, patch TaskTemplatePatch) (*TaskTemplate
 	if err != nil {
 		return nil, err
 	}
+	auditJSON := patch.AuditConfig
+	if len(auditJSON) == 0 {
+		auditJSON = json.RawMessage(`{}`)
+	}
 	t, err := scanTaskTemplate(d.QueryRow(`UPDATE task_templates
 SET name=CASE WHEN $2 THEN $3::text ELSE name END,
     nkey=CASE WHEN $2 THEN $4::text ELSE nkey END,
     description=CASE WHEN $5 THEN $6::text ELSE description END,
     goal=CASE WHEN $7 THEN $8::text ELSE goal END,
     category_id=CASE WHEN $9 THEN $10::bigint ELSE category_id END,
-    intercept_rules=CASE WHEN $11 THEN $12::jsonb ELSE intercept_rules END
+    intercept_rules=CASE WHEN $11 THEN $12::jsonb ELSE intercept_rules END,
+    task_mode=CASE WHEN $13 THEN $14::text ELSE task_mode END,
+    audit_config=CASE WHEN $15 THEN $16::jsonb ELSE audit_config END
 WHERE id=$1
 RETURNING `+taskTemplateCols,
 		id,
@@ -252,6 +333,8 @@ RETURNING `+taskTemplateCols,
 		patch.Goal != nil, patch.Goal,
 		patch.SetCategoryID, patch.CategoryID,
 		patch.SetInterceptRules, rulesJSON,
+		patch.Mode != nil, patch.Mode,
+		patch.SetAuditConfig, string(auditJSON),
 	))
 	if err == sql.ErrNoRows {
 		return nil, ErrTaskTemplateNotFound

@@ -37,6 +37,17 @@ func builtinToolsByAgent() map[string][]actool.CoreTool {
 		"mainagent": ts.MainAgentTools(),
 		"planner":   ts.PlannerTools(),
 		"worker":    ts.WorkerTools(),
+		// code_planner / code_worker are the restricted code-audit roles. Only these
+		// keys seed the audit-only tools (CodeGraph, structured code evidence,
+		// coverage receipts, artifacts, audit_progress), so ToolResolve cannot bind
+		// them to a pentest agent by default.
+		//
+		// Tool rows are seeded first-insert-only: existing DBs may lack the
+		// code_worker/code_planner bindings on shared tools. Audit runs deliberately
+		// bypass ToolResolve (see assembleAgentTools), so runtime correctness does
+		// not depend on those rows; new DBs still get the UI-visible bindings.
+		"code_planner": ts.AuditPlannerTools(),
+		"code_worker":  ts.AuditWorkerTools(),
 		// goals（目标拆解器）默认绑 set_goals + set_constraints：靠它们把拆出的目标、
 		// 抽出的操作约束写进库。与 mainagent 共用同一受管工具，web 端可改描述/schema、按 agent 勾选。
 		"goals": {ts.setGoals(), ts.setConstraints()},
@@ -62,7 +73,7 @@ var defaultUnbound = map[string]bool{"goal_met": true}
 // 多个 agent 都有）合成一条，Agents 取并集；defaultUnbound 里的工具则强制绑定为空。
 func BuiltinToolSeeds() []ToolSeed {
 	byAgent := builtinToolsByAgent()
-	order := []string{"mainagent", "goals", "planner", "worker", "auto", "pentest"}
+	order := []string{"mainagent", "goals", "planner", "worker", "code_planner", "code_worker", "auto", "pentest"}
 
 	type acc struct {
 		tool   actool.CoreTool

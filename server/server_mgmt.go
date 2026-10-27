@@ -101,7 +101,15 @@ func (s *Server) beginTaskDelete(taskID string) bool {
 	if s.engine.IsDeleting(taskID) {
 		return false
 	}
-	return s.engine.BeginDelete(taskID)
+	if !s.engine.BeginDelete(taskID) {
+		return false
+	}
+	// Cancel the audit run (source ingest or live engine loops) before waiting for
+	// quiescence; a delete that later aborts leaves the task paused, not running.
+	if s.auditDirector != nil {
+		s.auditDirector.Stop(taskID)
+	}
+	return true
 }
 
 // abortTaskDelete restores the execution barrier from the committed task row,
@@ -1906,7 +1914,8 @@ func (s *Server) restoreTasksAfterProfileDelete(pg *db.DB) {
 				// or clear the explicit chain and restore its Agent/global fallback.
 				// Resume only intents that were blocked by the exhausted chain; a
 				// paused task remains paused and terminal tasks remain immutable.
-				if !isTerminalStatus(task.lifecycleSnapshot().Status) && s.taskRuntimeAvailable(task, "planner", "worker") {
+				plannerKey, workerKey := plannerWorkerKeys(task)
+				if !isTerminalStatus(task.lifecycleSnapshot().Status) && s.taskRuntimeAvailable(task, plannerKey, workerKey) {
 					if _, reopenErr := task.Store.ReopenIntentsByBlockedReason(db.IntentBlockedLLMQuota); reopenErr != nil {
 						log.Printf("[llm-profile] task %s reopen quota-blocked intents after profile delete: %v", task.ID, reopenErr)
 					}

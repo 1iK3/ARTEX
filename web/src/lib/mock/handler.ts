@@ -12,6 +12,7 @@ import type {
   Activity,
   ArchiveBatchItem,
   Asset,
+  AuditConfig,
   BatchControlItem,
   Company,
   CompanyScopeRule,
@@ -998,6 +999,14 @@ function parseBody(body?: BodyInit | null): Record<string, unknown> {
   }
 }
 
+function mockAuditSourceLabel(cfg?: AuditConfig): string {
+  if (!cfg) return "—";
+  if (cfg.source_type === "git") return cfg.repo_url || "git";
+  if (cfg.source_type === "zip") return cfg.upload_id ? `zip:${cfg.upload_id}` : "zip";
+  const normalized = (cfg.local_path || "").replaceAll("\\", "/").replace(/\/+$/, "");
+  return normalized ? `local:${normalized.split("/").pop() || "source"}` : "local";
+}
+
 export async function mockHandle<T>(method: string, rawPath: string, body?: BodyInit | null): Promise<T> {
   advanceMockRetests();
   await delay();
@@ -1160,6 +1169,76 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     return publicMockTaskArchive(mockArchiveTask(seg[1]));
   }
 
+  // ── code audit ──
+  if (path === "/audit/capabilities" && m === "GET") {
+    return structuredClone(D.codeAuditCapabilities);
+  }
+  if (seg[0] === "tasks" && seg[2] === "audit") {
+    const owner = mockTasks.find((item) => item.id === seg[1]);
+    if (!owner) throw new Error("任务不存在");
+    if (owner.task_mode !== "code_audit") throw new Error("该任务不是代码审计任务");
+    if (seg[3] === "progress" && m === "GET") {
+      const progress = structuredClone(D.codeAuditProgress);
+      const cfg = owner.audit_config;
+      const terminalAudit = owner.status === "done";
+      if (progress.session) {
+        progress.session.task_id = mockTaskAssetIDs.get(owner.id) ?? progress.session.task_id;
+        if (cfg) {
+          progress.session.source_type = cfg.source_type;
+          progress.session.source_ref = mockAuditSourceLabel(cfg);
+          progress.session.source_label = mockAuditSourceLabel(cfg);
+          progress.session.depth = cfg.depth;
+          progress.session.max_rounds = cfg.max_rounds || progress.session.max_rounds;
+          if (cfg.languages && cfg.languages.length > 0) progress.session.languages = cfg.languages;
+        }
+        progress.session.status = terminalAudit ? progress.session.status : "running";
+      }
+      if (progress.budget) {
+        progress.budget.round = terminalAudit ? progress.budget.round : 1;
+        progress.budget.max_rounds = cfg?.max_rounds || progress.budget.max_rounds;
+        progress.budget.depth = cfg?.depth || progress.budget.depth;
+      }
+      if (progress.session && !terminalAudit) progress.session.round = 1;
+      progress.report_ready = terminalAudit;
+      progress.ready_to_complete = terminalAudit;
+      progress.report_url = terminalAudit ? `/api/tasks/${owner.id}/audit/report` : "";
+      if (!terminalAudit) {
+        progress.ready_reason = "审计仍在进行；完成后生成报告。";
+        progress.findings = { total: 0, by_verification: {} };
+        progress.candidates = [];
+        progress.hypotheses = [];
+        progress.rounds = [];
+      }
+      return progress;
+    }
+    if (seg[3] === "report" && m === "GET") {
+      if (owner.status !== "done") throw new Error("审计报告尚未生成");
+      return q.get("format") === "json"
+        ? JSON.stringify(D.codeAuditReportJSON, null, 2)
+        : D.codeAuditReportMD;
+    }
+    if (seg[3] === "source" && seg[4] === "file" && m === "GET") {
+      const rawPath = (q.get("path") ?? "").replaceAll("\\", "/");
+      const fixture = D.codeAuditSourceFiles[rawPath];
+      if (fixture) return structuredClone(fixture);
+      const line = Math.max(1, Number(q.get("line") ?? 1) || 1);
+      const start = Math.max(1, line - 8);
+      const end = start + 24;
+      const content = Array.from({ length: end - start + 1 }, (_, index) => {
+        const no = start + index;
+        return no === line ? `// ${rawPath}:${no} — mock source location` : `// ${rawPath}:${no}`;
+      }).join("\n");
+      return {
+        path: rawPath || "unknown",
+        start_line: start,
+        end_line: end,
+        total_lines: end,
+        content,
+        language: "text",
+      };
+    }
+  }
+
   // ── tasks ──
   if (path === "/tasks" && m === "GET") {
     sortMockTasks();
@@ -1170,23 +1249,39 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     while (mockTasks.some((item) => item.id === `t-new-${suffix}`)) suffix++;
     const id = `t-new-${suffix}`;
     const now = new Date();
+    const taskMode = b.task_mode === "code_audit" ? "code_audit" : "pentest";
+    const rawAudit = b.audit && typeof b.audit === "object" ? (b.audit as AuditConfig) : undefined;
+    const auditConfig = taskMode === "code_audit" && rawAudit ? structuredClone(rawAudit) : undefined;
+    if (taskMode === "code_audit") {
+      if (!auditConfig) throw new Error("代码审计任务缺少 audit 配置");
+      if (!["git", "local", "zip"].includes(auditConfig.source_type)) throw new Error("无效的 source_type");
+      if (auditConfig.source_type === "git" && !auditConfig.repo_url?.trim()) throw new Error("repo_url 不能为空");
+      if (auditConfig.source_type === "local" && !auditConfig.local_path?.trim()) throw new Error("local_path 不能为空");
+      if (auditConfig.source_type === "zip" && !auditConfig.upload_id?.trim()) throw new Error("zip 审计必须提供 upload_id");
+    }
     const profileIDs = [...((b.llm_profile_ids as number[] | undefined) ?? [])];
-    const sourceTaskIDs = [...((b.source_task_ids as string[] | undefined) ?? [])];
-    const companyIDs = [...new Set((b.company_ids as number[] | undefined) ?? [])];
+    const sourceTaskIDs = taskMode === "code_audit" ? [] : [...((b.source_task_ids as string[] | undefined) ?? [])];
+    const companyIDs = [...new Set(((b.company_ids as number[] | undefined) ?? []))];
     if (companyIDs.some((companyID) => !mockCompanies.some((company) => company.id === companyID))) {
       throw new Error("关联企业不存在或无效");
     }
     const categoryID = typeof b.category_id === "number" ? b.category_id : undefined;
     const category = categoryID === undefined ? undefined : mockTaskCategories.find((item) => item.id === categoryID);
     if (categoryID !== undefined && !category) throw new Error("任务分类不存在");
+    const defaultGoal =
+      taskMode === "code_audit"
+        ? `完成对 ${mockAuditSourceLabel(auditConfig)} 的全量深度代码审计`
+        : "";
     const created: Task = {
       id,
       name: String(b.name ?? ""),
       category_id: category?.id,
       category_name: category?.name,
       description: String(b.description ?? "新任务"),
-      goal: String(b.goal ?? ""),
+      goal: String(b.goal ?? "").trim() || defaultGoal,
       status: "created",
+      task_mode: taskMode,
+      ...(auditConfig ? { audit_config: auditConfig } : {}),
       created_at: now.toISOString(),
       created_unix: Math.floor(now.getTime() / 1000),
       paused: false,
@@ -1310,11 +1405,18 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       throw new Error("模板名称已存在");
     }
     const nextID = mockTaskTemplates.reduce((max, template) => Math.max(max, template.id), 0) + 1;
+    const taskMode = b.task_mode === "code_audit" ? "code_audit" : "pentest";
+    const auditConfig =
+      taskMode === "code_audit" && b.audit_config && typeof b.audit_config === "object"
+        ? structuredClone(b.audit_config as AuditConfig)
+        : undefined;
     const created: TaskTemplate = {
       id: nextID,
       name,
       description,
       goal,
+      task_mode: taskMode,
+      ...(auditConfig ? { audit_config: auditConfig } : {}),
       created_at: now,
       updated_at: now,
     };
@@ -1338,6 +1440,10 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     template.name = name;
     template.description = description;
     template.goal = goal;
+    if (b.task_mode === "pentest" || b.task_mode === "code_audit") template.task_mode = b.task_mode;
+    if (b.audit_config && typeof b.audit_config === "object") {
+      template.audit_config = structuredClone(b.audit_config as AuditConfig);
+    }
     template.updated_at = new Date().toISOString();
     mockTaskTemplates.sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id - a.id);
     return template;

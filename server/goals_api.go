@@ -14,6 +14,20 @@ import (
 // 终态→running、解除暂停、必要时排队),删除不复活(按产品决策)。每个变更 handler 都走
 // beginTaskOperation/decInflight,避免与任务删除竞态(与意图 CRUD 一致)。
 
+const codeAuditGoalsUnsupportedMessage = "代码审计任务暂不支持通过目标管理接口增删改目标（审计导演尚未接入）"
+
+// rejectCodeAuditGoalMutation blocks manual goal writes for code_audit tasks.
+// The pentest goals API creates goal nodes and wakes the planner; until the audit
+// director owns audit goals, those writes must not happen for an audit task.
+// Read-only listing stays available.
+func rejectCodeAuditGoalMutation(w http.ResponseWriter, t *Task) bool {
+	if t == nil || t.Mode != db.TaskModeCodeAudit {
+		return false
+	}
+	writeErr(w, http.StatusBadRequest, codeAuditGoalsUnsupportedMessage)
+	return true
+}
+
 // listGoals 返回本任务的全部目标(text/vulnclass/state 拆好),供目标管理卡片渲染。
 func (s *Server) listGoals(w http.ResponseWriter, r *http.Request) {
 	t, ok := s.m.Task(r.PathValue("id"))
@@ -35,6 +49,9 @@ func (s *Server) addGoal(w http.ResponseWriter, r *http.Request) {
 	t, ok := s.m.Task(r.PathValue("id"))
 	if !ok {
 		writeErr(w, 404, "task not found")
+		return
+	}
+	if rejectCodeAuditGoalMutation(w, t) {
 		return
 	}
 	if !s.engine.beginTaskOperation(t.ID) {
@@ -84,6 +101,9 @@ func (s *Server) editGoal(w http.ResponseWriter, r *http.Request) {
 	t, ok := s.m.Task(r.PathValue("id"))
 	if !ok {
 		writeErr(w, 404, "task not found")
+		return
+	}
+	if rejectCodeAuditGoalMutation(w, t) {
 		return
 	}
 	if !s.engine.beginTaskOperation(t.ID) {
@@ -140,6 +160,9 @@ func (s *Server) deleteGoal(w http.ResponseWriter, r *http.Request) {
 	t, ok := s.m.Task(r.PathValue("id"))
 	if !ok {
 		writeErr(w, 404, "task not found")
+		return
+	}
+	if rejectCodeAuditGoalMutation(w, t) {
 		return
 	}
 	if !s.engine.beginTaskOperation(t.ID) {

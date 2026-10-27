@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/audit"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
@@ -114,6 +115,12 @@ type Server struct {
 	taskAgentMu sync.Mutex
 	taskAgents  map[string]*taskAgentBundle
 
+	// Code-audit runtime: one lazy CodeGraph adapter per task plus the director
+	// that owns preflight, the run context, and intent-completion callbacks.
+	auditGraphMu  sync.Mutex
+	auditGraphs   map[string]*auditCodeGraph
+	auditDirector *AuditDirector
+
 	// Cold task archives run through one persistent FIFO worker. The buffered wake
 	// channel coalesces enqueue bursts; the database remains the source of truth.
 	archiveWake chan struct{}
@@ -150,8 +157,20 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
-		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
+		taskAgents: map[string]*taskAgentBundle{}, auditGraphs: map[string]*auditCodeGraph{},
+		archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
+	s.auditDirector = newAuditDirector(s)
+	// Intent completion feeds the audit director's basic phase bookkeeping and
+	// planner wake. Pentest tasks are ignored by the callback.
+	s.engine.SetIntentObserver(s.auditDirector.OnIntentDone)
+	// Shutdown: cancel audit runs (which also releases their engine loops) and
+	// close every spawned CodeGraph MCP subprocess.
+	go func() {
+		<-ctx.Done()
+		s.auditDirector.StopAll()
+		s.closeAllAuditGraphs()
+	}()
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()
@@ -159,7 +178,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// that router through Agent bindings and then the global provider, so adding a
 	// first chain to a running task takes effect on its very next LLM call.
 	s.engine.SetAuthoritativeAgentResolver(func(t *Task) (*agent.Planner, *agent.Worker) {
-		if !s.taskRuntimeAvailable(t, "planner", "worker") {
+		plannerKey, workerKey := plannerWorkerKeys(t)
+		if !s.taskRuntimeAvailable(t, plannerKey, workerKey) {
 			return nil, nil
 		}
 		b := s.agentsForTask(t)
@@ -277,7 +297,8 @@ func (s *Server) restoreTaskRuntimes() {
 		}
 		// 任务级超时:为每个未终态、带 timeout 的任务起 deadline 协调器,独立于 planner/worker
 		// loop——非活跃任务重启后也能在到点后被收尾(deadline 已过则立即走收尾时序)。
-		if !isTerminalStatus(lifecycle.Status) {
+		// code_audit 不走渗透收尾/终局 planner;审计导演自行管理运行生命周期。
+		if !isTerminalStatus(lifecycle.Status) && t.Mode != db.TaskModeCodeAudit {
 			s.engine.startDeadlineCoordinator(s.ctx, t)
 		}
 	}
@@ -287,9 +308,19 @@ func (s *Server) restoreTaskRuntimes() {
 	// FIFO. Paused loops remain idle; queued tasks are admitted below as slots allow.
 	for _, t := range m.List() {
 		lifecycle := t.lifecycleSnapshot()
-		if !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
-			s.engine.Run(s.ctx, t)
+		if lifecycle.Queued || isTerminalStatus(lifecycle.Status) {
+			continue
 		}
+		if t.Mode == db.TaskModeCodeAudit {
+			// Restart an admitted audit task through the director (reuses a running
+			// session or finishes a previously interrupted ingest). Run it detached
+			// so a slow source ingest never blocks server startup.
+			if !lifecycle.Paused {
+				go s.startCodeAudit(t)
+			}
+			continue
+		}
+		s.engine.Run(s.ctx, t)
 	}
 }
 
@@ -684,6 +715,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}", s.getTask)
 	mux.HandleFunc("PATCH /api/tasks/{id}", s.updateTaskMetadata)
 	mux.HandleFunc("PATCH /api/tasks/{id}/category", s.updateTaskCategory)
+	// Code-audit progress/report/source. These are more specific than
+	// GET /api/tasks/{id} and only serve code_audit tasks.
+	mux.HandleFunc("GET /api/tasks/{id}/audit/progress", s.auditProgress)
+	mux.HandleFunc("GET /api/tasks/{id}/audit/report", s.auditReport)
+	mux.HandleFunc("GET /api/tasks/{id}/audit/source/file", s.auditSourceFile)
+	mux.HandleFunc("GET /api/audit/capabilities", s.auditCapabilities)
 	// 任务级资产拦截/允许规则
 	mux.HandleFunc("GET /api/tasks/{id}/intercept-rules", s.taskInterceptListRules)
 	mux.HandleFunc("POST /api/tasks/{id}/intercept-rules", s.taskInterceptCreateRule)
@@ -1104,7 +1141,8 @@ func (s *Server) setActive(w http.ResponseWriter, r *http.Request) {
 	}
 	// resume the engine for the opened task (idempotent — no-op if already running).
 	// 排队中的任务:仅设为活跃可查看,不启动引擎(维持并发上限,由 reconcile 补位)。
-	if t, ok := s.m.Task(req.ID); ok && !t.lifecycleSnapshot().Queued {
+	// code_audit runs under the audit director, not by opening the task in the UI.
+	if t, ok := s.m.Task(req.ID); ok && !t.lifecycleSnapshot().Queued && t.Mode != db.TaskModeCodeAudit {
 		s.engine.Run(s.ctx, t)
 	}
 	writeJSON(w, 200, map[string]any{"active": req.ID})
@@ -1455,6 +1493,10 @@ type createTaskReq struct {
 	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
 	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
 	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
+	// TaskMode selects the execution pipeline: pentest (default) or code_audit.
+	// Audit is required for code_audit and rejected for pentest.
+	TaskMode string        `json:"task_mode,omitempty"`
+	Audit    *audit.Config `json:"audit,omitempty"`
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
 }
@@ -1468,6 +1510,12 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(req.Description) == "" {
 		req.Description = "未命名任务"
 	}
+	modeOptions, err := resolveTaskModeOptions(req.TaskMode, req.Audit, req.Goal, s.auditLocalRoots())
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	req.Goal = modeOptions.Goal
 	if len(req.LLMProfileIDs) == 0 && req.LLMProfileID != nil {
 		req.LLMProfileIDs = []int64{*req.LLMProfileID}
 	}
@@ -1514,8 +1562,13 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
 		CoverageEnabled: req.CoverageEnabled,
 		InterceptRules:  interceptRules,
+		Mode:            modeOptions.Mode, AuditConfig: modeOptions.AuditConfig,
 	})
 	if err != nil {
+		if errors.Is(err, db.ErrTaskModeInvalid) {
+			writeErr(w, 400, "无效的任务模式")
+			return
+		}
 		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {
 			writeErr(w, 400, "任务分类不存在或无效")
 			return
@@ -2073,7 +2126,7 @@ func (s *Server) getFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	assets := s.resolveAssetIDs(f.AssetIDs)
-	dto := findingFromDB(f, assets)
+	dto := findingFromDBDetail(f, assets)
 	if contextTaskID := strings.TrimSpace(r.URL.Query().Get("context_task")); contextTaskID != "" {
 		contextTask := s.m.ResolveTask(contextTaskID)
 		if contextTask == nil {

@@ -190,7 +190,9 @@ func idSet(ids []int64) map[int64]bool {
 // seedPrompts writes each built-in agent's code-default prompt body into
 // agent_prompts on startup — first-insert only (SeedPromptIfEmpty is a no-op once
 // any version exists), so the DB becomes the authoritative editable source while
-// user edits survive restarts. Runs after seedBuiltins has created the agent rows.
+// user edits survive restarts. Runs after seedBuiltins has created the agent rows
+// (db.Open → seedBuiltins → Server.New → seedPrompts), which is why code_planner
+// and code_worker must be registered in db/db.go builtinAgents too.
 func seedPrompts(pg *db.DB) {
 	for key, tmpl := range agent.BuiltinPromptSeeds() {
 		a, err := pg.GetAgentByKey(key)

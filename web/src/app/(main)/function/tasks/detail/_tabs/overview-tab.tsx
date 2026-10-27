@@ -31,6 +31,7 @@ import { api } from "@/lib/api";
 import type {
   AssetInterceptKind,
   AssetInterceptRule,
+  AuditProgress,
   Finding,
   ModelTokenStat,
   Stats,
@@ -106,6 +107,7 @@ function StatCard({
 export function OverviewTab({ taskId }: { taskId: string }) {
   const [task, setTask] = React.useState<Task | null>(null);
   const [stats, setStats] = React.useState<Stats | null>(null);
+  const [auditProgress, setAuditProgress] = React.useState<AuditProgress | null>(null);
   const [intents, setIntents] = React.useState<TaskNode[]>([]);
   const [findings, setFindings] = React.useState<Finding[]>([]);
   const [coverage, setCoverage] = React.useState<{
@@ -378,6 +380,18 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         setStats(statsResp);
         setIntents(intentsResp);
         setFindings(findingsResp);
+        if (taskResp.task_mode === "code_audit") {
+          api
+            .auditProgress(taskId)
+            .then((next) => {
+              if (!cancelled) setAuditProgress(next);
+            })
+            .catch(() => {
+              // 审计会话可能尚未建立；下一轮轮询重试。
+            });
+        } else {
+          setAuditProgress(null);
+        }
         // coverage is independent + may 503 when no asset store — fetch separately so
         // its failure never blocks the others.
         api
@@ -450,6 +464,59 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           </div>
         </CardContent>
       </Card>
+      {task?.task_mode === "code_audit" && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <ShieldCheckIcon className="size-4 text-primary" /> 代码审计配置
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="grid grid-cols-2 gap-4 text-sm lg:grid-cols-4">
+            <div>
+              <div className="text-xs text-muted-foreground">任务模式</div>
+              <div className="mt-1 font-medium">代码审计</div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">源码</div>
+              <div
+                className="mt-1 truncate font-mono text-xs"
+                title={auditProgress?.source_label ?? auditProgress?.session?.source_label}
+              >
+                {auditProgress?.source_label ??
+                  auditProgress?.session?.source_label ??
+                  auditProgress?.session?.source_type ??
+                  task.audit_config?.source_type ??
+                  "—"}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">深度 / 轮次</div>
+              <div className="mt-1">
+                {auditProgress?.session?.depth ?? task.audit_config?.depth ?? "—"} · R
+                {auditProgress?.session?.round ?? 0}/{auditProgress?.session?.max_rounds ?? task.audit_config?.max_rounds ?? "—"}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">Commit</div>
+              <div className="mt-1 truncate font-mono text-xs">
+                {auditProgress?.session?.commit_sha?.slice(0, 12) || "—"}
+              </div>
+            </div>
+            <div className="col-span-2 lg:col-span-4">
+              <div className="text-xs text-muted-foreground">引擎配置</div>
+              <div className="mt-1 flex flex-wrap gap-2 text-xs">
+                {(["codegraph", "codeql", "joern"] as const).map((name) => (
+                  <span key={name} className="bg-muted rounded px-1.5 py-0.5 font-mono">
+                    {name}: {task.audit_config?.engines?.[name] ?? "默认"}
+                  </span>
+                ))}
+                {task.audit_config?.include_tests && <span className="bg-muted rounded px-1.5 py-0.5">含测试</span>}
+                {task.audit_config?.include_vendor && <span className="bg-muted rounded px-1.5 py-0.5">含 vendor</span>}
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
       {/* 目标管理：查看/新增/修改/删除本任务的探索目标。新增与修改会通知规划者并复活任务，
           删除仅通知规划者（不复活）。目标 = 最终可交付/可核验的结果，不是攻击步骤或侦察动作。 */}
       <Card>

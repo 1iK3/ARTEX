@@ -24,6 +24,8 @@ type taskTemplateRequest struct {
 	Goal           *string                `json:"goal"`
 	CategoryID     *int64                 `json:"category_id"`
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules"`
+	TaskMode       *string                `json:"task_mode"`
+	AuditConfig    json.RawMessage        `json:"audit_config"`
 }
 
 // decodeTaskTemplateRequest decodes the body into req and returns the set of
@@ -125,12 +127,19 @@ func (s *Server) pgCreateTaskTemplate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "拦截/允许规则无效："+err.Error())
 		return
 	}
+	mode, auditConfig, err := normalizeTemplateModeConfig(stringValue(req.TaskMode), req.AuditConfig, s.auditLocalRoots())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	template, err := pg.CreateTaskTemplate(db.TaskTemplateInput{
 		Name:           stringValue(req.Name),
 		Description:    stringValue(req.Description),
 		Goal:           stringValue(req.Goal),
 		CategoryID:     req.CategoryID,
 		InterceptRules: rules,
+		Mode:           mode,
+		AuditConfig:    auditConfig,
 	})
 	if err != nil {
 		writeTaskTemplateErr(w, err)
@@ -160,8 +169,10 @@ func (s *Server) pgUpdateTaskTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	_, catPresent := present["category_id"]
 	_, rulesPresent := present["intercept_rules"]
-	if req.Name == nil && req.Description == nil && req.Goal == nil && !catPresent && !rulesPresent {
-		writeErr(w, http.StatusBadRequest, "至少需要提供 name、description、goal、category_id 或 intercept_rules")
+	_, modePresent := present["task_mode"]
+	_, auditPresent := present["audit_config"]
+	if req.Name == nil && req.Description == nil && req.Goal == nil && !catPresent && !rulesPresent && !modePresent && !auditPresent {
+		writeErr(w, http.StatusBadRequest, "至少需要提供 name、description、goal、category_id、intercept_rules、task_mode 或 audit_config")
 		return
 	}
 	patch := db.TaskTemplatePatch{Name: req.Name, Description: req.Description, Goal: req.Goal}
@@ -177,6 +188,52 @@ func (s *Server) pgUpdateTaskTemplate(w http.ResponseWriter, r *http.Request) {
 		}
 		patch.SetInterceptRules = true
 		patch.InterceptRules = rules
+	}
+	if modePresent || auditPresent {
+		mode := db.TaskModePentest
+		auditConfig := json.RawMessage(`{}`)
+		if modePresent {
+			// An explicit null/blank task_mode must not silently downgrade the
+			// template or wipe its audit_config.
+			parsed, err := templatePatchMode(req.TaskMode)
+			if err != nil {
+				writeErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			mode = parsed
+		}
+		if auditPresent {
+			auditConfig = req.AuditConfig
+		}
+		// Only load the stored counterpart when it is actually needed. Switching
+		// to pentest without an explicit config clears the old audit config
+		// instead of validating it against the new mode.
+		needExisting := !modePresent || (!auditPresent && mode == db.TaskModeCodeAudit)
+		if needExisting {
+			existing, err := pg.GetTaskTemplate(id)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if existing == nil {
+				writeTaskTemplateErr(w, db.ErrTaskTemplateNotFound)
+				return
+			}
+			if !modePresent {
+				mode = existing.Mode
+			}
+			if !auditPresent {
+				auditConfig = existing.AuditConfig
+			}
+		}
+		mode, auditConfig, err := normalizeTemplateModeConfig(mode, auditConfig, s.auditLocalRoots())
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		patch.Mode = &mode
+		patch.SetAuditConfig = true
+		patch.AuditConfig = auditConfig
 	}
 	template, err := pg.PatchTaskTemplate(id, patch)
 	if err != nil {

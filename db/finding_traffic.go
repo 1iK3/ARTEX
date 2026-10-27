@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -11,7 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/audit"
 	"github.com/Autumn-27/artex/notify"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var (
@@ -329,12 +332,46 @@ type RecordFindingInput struct {
 	TaskID, ExplorationID, IntentID                      int64
 	VulnClass, Name, Severity, Summary, Evidence, Worker string
 	AssetIDs                                             []int64
+
+	// Code-audit fields. They are persisted on both the exploration finding
+	// node payload (for the per-task graph view) and the standalone findings row.
+	CWEID        string
+	CodePath     string
+	CodeLine     int
+	CodeSymbol   string
+	Confidence   float64
+	Verification string // defaults to "unverified"
+	DedupeKey    string
+	CodeEvidence json.RawMessage
+	AuditRound   int
+	AuditPhase   string
 }
 
 type RecordedFinding struct {
 	FindingID int64           `json:"finding_id,string"`
 	NodeID    int64           `json:"finding_node_id,string"`
 	Traffic   *FindingTraffic `json:"traffic"`
+	// Duplicate is true when (task_id, dedupe_key) already existed. The returned
+	// IDs point at the existing rows; no new node, anchors or notification are
+	// created.
+	Duplicate bool `json:"duplicate,omitempty"`
+}
+
+// CodeFindingInput is the direct-row shape used by AddCodeFinding. CWEID is
+// stored as the finding's vulnclass and Title as its display name.
+type CodeFindingInput struct {
+	TaskID, NodeID                                    int64
+	CWEID, Title, Severity, Summary, Evidence, Worker string
+	CodePath                                          string
+	CodeLine                                          int
+	CodeSymbol                                        string
+	Confidence                                        float64
+	Verification                                      string
+	DedupeKey                                         string
+	CodeEvidence                                      json.RawMessage
+	AuditRound                                        int
+	AuditPhase                                        string
+	AssetIDs                                          []int64
 }
 
 // ctx 由调用方传入本次事务所用的上下文（而非在内部取 context.Background）：
@@ -361,19 +398,74 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 			return nil, errors.New("intent_id 必须是本任务的意图（关联任务意图只读）")
 		}
 	}
-	payload, _ := json.Marshal(map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
+
+	verification := strings.TrimSpace(in.Verification)
+	if verification == "" {
+		verification = "unverified"
+	}
+	dedupeKey := codeFindingDedupeKey(in.CWEID, in.CodePath, in.CodeLine, in.CodeSymbol, in.DedupeKey)
+	codeEvidence, err := persistedCodeEvidence(in.CodeEvidence)
+	if err != nil {
+		return nil, err
+	}
+
+	// 去重先于建图节点：命中已有 (task_id,dedupe_key) 时只返回既有 finding，
+	// 不再新节点、锚点、边或推送，避免同一证据在任务图上重复出现。
+	if dedupeKey != "" && in.TaskID > 0 {
+		existing, err := duplicateFindingTx(tx, in.TaskID, dedupeKey)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil {
+			return existing, nil
+		}
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"vulnclass":     in.VulnClass,
+		"name":          in.Name,
+		"severity":      in.Severity,
+		"summary":       in.Summary,
+		"evidence":      map[string]any{"by": in.Worker, "poc": in.Evidence},
+		"cwe_id":        in.CWEID,
+		"code_path":     in.CodePath,
+		"code_line":     in.CodeLine,
+		"code_symbol":   in.CodeSymbol,
+		"confidence":    in.Confidence,
+		"verification":  verification,
+		"dedupe_key":    dedupeKey,
+		"code_evidence": codeEvidence,
+		"audit_round":   in.AuditRound,
+		"audit_phase":   in.AuditPhase,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encode finding payload: %w", err)
+	}
+
+	// A unique violation aborts the whole transaction in PostgreSQL. The
+	// savepoint lets us roll back the speculative node/anchor/edge work and
+	// return the concurrently-created finding as a duplicate. Concurrent
+	// writers normally serialize on LockTaskEvidenceTx, so this is a safety net
+	// for rows inserted through another path.
+	useSavepoint := dedupeKey != "" && in.TaskID > 0
+	if useSavepoint {
+		if _, err := tx.ExecContext(ctx, `SAVEPOINT record_finding_dedupe`); err != nil {
+			return nil, err
+		}
+	}
+
 	out := &RecordedFinding{}
-	if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
+	if err := tx.QueryRowContext(ctx, `INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
 VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string(payload), in.Worker).Scan(&out.NodeID); err != nil {
 		return nil, err
 	}
 	for _, asset := range in.AssetIDs {
-		if _, err := tx.Exec(`INSERT INTO exploration_anchors(node_id,asset_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, out.NodeID, asset); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_anchors(node_id,asset_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, out.NodeID, asset); err != nil {
 			return nil, err
 		}
 	}
 	if in.IntentID > 0 {
-		if _, err := tx.Exec(`INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id) VALUES($1,$2,$3,$4)`, in.ExplorationID, in.IntentID, RelYields, out.NodeID); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id) VALUES($1,$2,$3,$4)`, in.ExplorationID, in.IntentID, RelYields, out.NodeID); err != nil {
 			return nil, err
 		}
 	}
@@ -382,9 +474,33 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 		assets = []int64{}
 	}
 	raw, _ := json.Marshal(assets)
-	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids)
-VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw)).Scan(&out.FindingID); err != nil {
+	if err := tx.QueryRowContext(ctx, `INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,
+cwe_id,code_path,code_line,code_symbol,confidence,verification,dedupe_key,code_evidence,audit_round,audit_phase)
+VALUES(NULLIF($1,0),NULLIF($2,0),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING id`,
+		in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw),
+		in.CWEID, in.CodePath, in.CodeLine, in.CodeSymbol, in.Confidence, verification, dedupeKey, string(codeEvidence),
+		in.AuditRound, in.AuditPhase).Scan(&out.FindingID); err != nil {
+		if useSavepoint && isUniqueViolation(err) {
+			if _, rbErr := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT record_finding_dedupe`); rbErr != nil {
+				return nil, rbErr
+			}
+			if _, relErr := tx.ExecContext(ctx, `RELEASE SAVEPOINT record_finding_dedupe`); relErr != nil {
+				return nil, relErr
+			}
+			existing, selErr := duplicateFindingTx(tx, in.TaskID, dedupeKey)
+			if selErr != nil {
+				return nil, selErr
+			}
+			if existing != nil {
+				return existing, nil
+			}
+		}
 		return nil, err
+	}
+	if useSavepoint {
+		if _, err := tx.ExecContext(ctx, `RELEASE SAVEPOINT record_finding_dedupe`); err != nil {
+			return nil, err
+		}
 	}
 	// 在**同一事务**里登记一条推送事件：提交即保证「漏洞落库」与「推送任务存在」
 	// 原子一致，不存在提交成功却没入队、消息永久丢失的窗口。
@@ -402,9 +518,120 @@ VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeI
 	if err := AddFindingTrafficTx(tx, out.FindingID, prepared); err != nil {
 		return nil, err
 	}
-	var err error
 	out.Traffic, err = FindingTrafficTx(tx, out.FindingID)
 	return out, err
+}
+
+// duplicateFindingTx returns the existing finding for (task_id,dedupe_key), or
+// nil when none exists. It locks the row so concurrent duplicate submissions
+// observe a stable id/node pair.
+func duplicateFindingTx(tx *sql.Tx, taskID int64, dedupeKey string) (*RecordedFinding, error) {
+	var id int64
+	var nodeID sql.NullInt64
+	err := tx.QueryRow(`SELECT id,node_id FROM findings WHERE task_id=$1 AND dedupe_key=$2 FOR UPDATE`, taskID, dedupeKey).Scan(&id, &nodeID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := &RecordedFinding{FindingID: id, Duplicate: true}
+	if nodeID.Valid {
+		out.NodeID = nodeID.Int64
+	}
+	traffic, err := FindingTrafficTx(tx, id)
+	if err != nil {
+		if errors.Is(err, ErrFindingNotFound) {
+			return out, nil
+		}
+		return nil, err
+	}
+	out.Traffic = traffic
+	return out, nil
+}
+
+// codeFindingDedupeKey returns the server-owned identity for a finding. When any
+// code identity field is present the key is always recomputed from the canonical
+// CWE/path/line/symbol tuple, so a caller-supplied key (mismatched or empty)
+// can never bypass or fragment dedupe. Findings without code identity keep the
+// supplied key so legacy pentest recording is unchanged.
+func codeFindingDedupeKey(cwe, codePath string, codeLine int, codeSymbol, supplied string) string {
+	if strings.TrimSpace(cwe) == "" && strings.TrimSpace(codePath) == "" &&
+		codeLine <= 0 && strings.TrimSpace(codeSymbol) == "" {
+		return strings.TrimSpace(supplied)
+	}
+	return audit.DedupeKey(cwe, codePath, codeLine, codeSymbol)
+}
+
+func persistedCodeEvidence(raw json.RawMessage) (json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return json.RawMessage(`{}`), nil
+	}
+	if len(trimmed) > audit.MaxCodeEvidenceBytes {
+		return nil, fmt.Errorf("%w: code_evidence %d bytes > %d",
+			audit.ErrCodeEvidenceTooLarge, len(trimmed), audit.MaxCodeEvidenceBytes)
+	}
+	if !json.Valid(trimmed) {
+		return nil, errors.New("code_evidence 不是合法 JSON")
+	}
+	return json.RawMessage(jsonbClean(trimmed)), nil
+}
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// AddCodeFinding inserts a standalone code-audit finding row directly. Unlike
+// RecordFindingTx it does not create an exploration node or a notification; it
+// is meant for callers that already own a node (or none). It honors
+// (task_id,dedupe_key) and reports duplicate=true with the existing id when the
+// key is already present.
+func (d *DB) AddCodeFinding(in CodeFindingInput) (id int64, duplicate bool, err error) {
+	verification := strings.TrimSpace(in.Verification)
+	if verification == "" {
+		verification = "unverified"
+	}
+	dedupeKey := codeFindingDedupeKey(in.CWEID, in.CodePath, in.CodeLine, in.CodeSymbol, in.DedupeKey)
+	codeEvidence, err := persistedCodeEvidence(in.CodeEvidence)
+	if err != nil {
+		return 0, false, err
+	}
+	aidsJSON, _ := json.Marshal(in.AssetIDs)
+	if in.AssetIDs == nil {
+		aidsJSON = []byte("[]")
+	}
+
+	err = d.WithEvidenceTx(context.Background(), func(tx *sql.Tx) error {
+		if err := LockTaskEvidenceTx(tx, in.TaskID); err != nil {
+			return err
+		}
+		insert := func(onConflict string) error {
+			q := `INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,
+cwe_id,code_path,code_line,code_symbol,confidence,verification,dedupe_key,code_evidence,audit_round,audit_phase)
+VALUES(NULLIF($1,0),NULLIF($2,0),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)` + onConflict + ` RETURNING id`
+			return tx.QueryRow(q, in.TaskID, in.NodeID, in.CWEID, in.Title, in.Severity, in.Summary, in.Evidence, in.Worker, string(aidsJSON),
+				in.CWEID, in.CodePath, in.CodeLine, in.CodeSymbol, in.Confidence, verification, dedupeKey, string(codeEvidence),
+				in.AuditRound, in.AuditPhase).Scan(&id)
+		}
+		if dedupeKey != "" && in.TaskID > 0 {
+			insertErr := insert(` ON CONFLICT (task_id, dedupe_key) WHERE dedupe_key <> '' DO NOTHING`)
+			if insertErr == nil {
+				return nil
+			}
+			if !errors.Is(insertErr, sql.ErrNoRows) {
+				return insertErr
+			}
+			duplicate = true
+			return tx.QueryRow(`SELECT id FROM findings WHERE task_id=$1 AND dedupe_key=$2`, in.TaskID, dedupeKey).Scan(&id)
+		}
+		return insert("")
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	return id, duplicate, nil
 }
 
 // RecordFinding is the atomic legacy/no-recorder path used by tools and tests.
@@ -473,4 +700,122 @@ func (d *DB) SetFindingReportVersionByNodeID(ctx context.Context, nodeID int64, 
 		return err
 	})
 	return
+}
+
+// UpdateFindingVerification applies an independent verification verdict to one
+// code-audit finding owned by taskID. It updates the standalone findings row
+// (verification + code_evidence.verification/confidence) and, when the finding
+// has an exploration node, the matching node payload fields so the graph view
+// agrees with the findings view. Ownership is enforced in the same transaction;
+// a missing finding or a node that does not belong to the task is an error.
+func (d *DB) UpdateFindingVerification(ctx context.Context, taskID, findingID int64, verification, method, evidence, altPath string, confidence *float64) error {
+	if taskID <= 0 || findingID <= 0 {
+		return fmt.Errorf("task_id 和 finding_id 必须为正整数")
+	}
+	if !audit.ValidVerificationStatus(verification) {
+		return fmt.Errorf("未知的 verification 状态 %q", verification)
+	}
+	if !audit.ValidVerificationMethod(method) {
+		return fmt.Errorf("未知的 verification method %q", method)
+	}
+	if strings.TrimSpace(evidence) == "" {
+		return errors.New("verification evidence 不能为空")
+	}
+	if confidence != nil && (*confidence < 0 || *confidence > 1) {
+		return fmt.Errorf("confidence %v 必须在 [0,1] 内", *confidence)
+	}
+
+	return d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		var nodeID sql.NullInt64
+		var raw []byte
+		err := tx.QueryRowContext(ctx,
+			`SELECT node_id, code_evidence FROM findings WHERE id=$1 AND task_id=$2 FOR UPDATE`,
+			findingID, taskID).Scan(&nodeID, &raw)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrFindingNotFound
+		}
+		if err != nil {
+			return err
+		}
+
+		codeEvidence := map[string]any{}
+		if len(bytes.TrimSpace(raw)) > 0 {
+			if err := json.Unmarshal(raw, &codeEvidence); err != nil {
+				return fmt.Errorf("decode finding code_evidence: %w", err)
+			}
+			if codeEvidence == nil {
+				codeEvidence = map[string]any{}
+			}
+		}
+		verdict, _ := codeEvidence["verification"].(map[string]any)
+		if verdict == nil {
+			verdict = map[string]any{}
+		}
+		verdict["status"] = verification
+		verdict["method"] = method
+		verdict["reason"] = strings.TrimSpace(evidence)
+		if alt := strings.TrimSpace(altPath); alt != "" {
+			verdict["alternative_path"] = alt
+		} else {
+			delete(verdict, "alternative_path")
+		}
+		codeEvidence["verification"] = verdict
+		if confidence != nil {
+			codeEvidence["confidence"] = *confidence
+		}
+		encoded, err := json.Marshal(codeEvidence)
+		if err != nil {
+			return fmt.Errorf("encode finding code_evidence: %w", err)
+		}
+		if confidence != nil {
+			_, err = tx.ExecContext(ctx,
+				`UPDATE findings SET verification=$3, code_evidence=$4::jsonb, confidence=$5 WHERE id=$1 AND task_id=$2`,
+				findingID, taskID, verification, string(jsonbClean(encoded)), *confidence)
+		} else {
+			_, err = tx.ExecContext(ctx,
+				`UPDATE findings SET verification=$3, code_evidence=$4::jsonb WHERE id=$1 AND task_id=$2`,
+				findingID, taskID, verification, string(jsonbClean(encoded)))
+		}
+		if err != nil {
+			return err
+		}
+
+		if !nodeID.Valid {
+			return nil
+		}
+		var payloadRaw []byte
+		err = tx.QueryRowContext(ctx, `
+SELECT payload FROM exploration_nodes
+WHERE id=$1
+  AND exploration_id=(SELECT exploration_id FROM tasks WHERE id=$2)
+FOR UPDATE`, nodeID.Int64, taskID).Scan(&payloadRaw)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: finding node %d 不属于任务 %d", ErrFindingNotFound, nodeID.Int64, taskID)
+		}
+		if err != nil {
+			return err
+		}
+		payload := map[string]any{}
+		if len(bytes.TrimSpace(payloadRaw)) > 0 {
+			if err := json.Unmarshal(payloadRaw, &payload); err != nil {
+				return fmt.Errorf("decode finding node payload: %w", err)
+			}
+			if payload == nil {
+				payload = map[string]any{}
+			}
+		}
+		payload["verification"] = verification
+		payload["code_evidence"] = codeEvidence
+		if confidence != nil {
+			payload["confidence"] = *confidence
+		}
+		nodeJSON, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("encode finding node payload: %w", err)
+		}
+		_, err = tx.ExecContext(ctx,
+			`UPDATE exploration_nodes SET payload=$2::jsonb WHERE id=$1`,
+			nodeID.Int64, string(jsonbClean(nodeJSON)))
+		return err
+	})
 }

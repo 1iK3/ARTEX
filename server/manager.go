@@ -55,16 +55,20 @@ type Task struct {
 	CompanyIDs         []int64 `json:"company_ids,omitempty"`
 	Status             string  `json:"status"` // persisted lifecycle status (done/failed/timeout 为终态；空/其它则由运行态推导)
 	// 任务级超时(见 docs/任务级超时与收尾设计.md)。DeadlineAt/FirstRunAt 为 unix 秒,0=未设/未运行。
-	TimeoutSeconds       int                    `json:"timeout_seconds"`
-	PlanHeartbeatSeconds int                    `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
-	CoverageEnabled      bool                   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
-	FirstRunAt           int64                  `json:"first_run_at,omitempty"`
-	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
-	Store                *pgdb.ExplorationStore `json:"-"`
-	Guard                *guard.Guard           `json:"-"`
-	notify               chan struct{}
-	lifecycleMu          sync.RWMutex
-	llmMu                sync.RWMutex
+	TimeoutSeconds       int  `json:"timeout_seconds"`
+	PlanHeartbeatSeconds int  `json:"plan_heartbeat_seconds"` // planner 心跳触发间隔(秒)
+	CoverageEnabled      bool `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
+	// Mode selects the task execution pipeline (pentest|code_audit). It is frozen
+	// at creation. AuditConfig is the normalized audit.Config for code_audit tasks.
+	Mode        string                 `json:"task_mode"`
+	AuditConfig json.RawMessage        `json:"audit_config,omitempty"`
+	FirstRunAt  int64                  `json:"first_run_at,omitempty"`
+	DeadlineAt  int64                  `json:"deadline_at,omitempty"`
+	Store       *pgdb.ExplorationStore `json:"-"`
+	Guard       *guard.Guard           `json:"-"`
+	notify      chan struct{}
+	lifecycleMu sync.RWMutex
+	llmMu       sync.RWMutex
 
 	// pendingTriggers accumulates the concrete changes (worker done / finding) that
 	// fired planning rounds since the last one consumed them. The debounce coalesces
@@ -829,6 +833,14 @@ func unixNanoOrZero(t *time.Time) int64 {
 }
 
 func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor) *Task {
+	mode := pt.Mode
+	if mode == "" {
+		mode = pgdb.TaskModePentest
+	}
+	var auditConfig json.RawMessage
+	if len(pt.AuditConfig) > 0 {
+		auditConfig = append(json.RawMessage(nil), pt.AuditConfig...)
+	}
 	return &Task{
 		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
 		Name:       pt.Name,
@@ -845,7 +857,8 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		CompanyIDs:     append([]int64(nil), pt.CompanyIDs...),
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled,
-		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
+		Mode:            mode, AuditConfig: auditConfig,
+		FirstRunAt: unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
 	}
 }

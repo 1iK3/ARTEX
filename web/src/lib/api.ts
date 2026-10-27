@@ -17,6 +17,10 @@ import type {
   AssetInterceptRule,
   AssetInterceptRuleInput,
   Audit,
+  AuditCapabilities,
+  AuditConfig,
+  AuditProgress,
+  AuditSourceFile,
   BatchCategoryItem,
   BatchControlItem,
   ChatAttachment,
@@ -88,6 +92,7 @@ import type {
   TaskConstraint,
   TaskGoal,
   TaskLLMResolutions,
+  TaskMode,
   TaskNode,
   TaskScopeRow,
   TaskTemplate,
@@ -247,11 +252,77 @@ export const api = {
   tasks: () =>
     get<{ tasks: Task[]; active: string }>("/tasks").then((r) => ({ tasks: arr(r.tasks), active: r.active ?? "" })),
   task: (id: string) => get<Task>(`/tasks/${encodeURIComponent(id)}`),
+  // ---- code audit ----
+  auditProgress: (taskId: string) => get<AuditProgress>(`/tasks/${encodeURIComponent(taskId)}/audit/progress`),
+  auditCapabilities: () => get<AuditCapabilities>("/audit/capabilities"),
+  auditSourceFile: (taskId: string, path: string, line?: number) => {
+    const query = new URLSearchParams({ path });
+    if (line && line > 0) query.set("line", String(line));
+    return get<AuditSourceFile>(`/tasks/${encodeURIComponent(taskId)}/audit/source/file?${query.toString()}`);
+  },
+  auditReportUrl: (taskId: string, format: "md" | "json" = "md") =>
+    `/api/tasks/${encodeURIComponent(taskId)}/audit/report?format=${format}`,
+  auditReport: async (taskId: string, format: "md" | "json" = "md") => {
+    if (MOCK) return mockHandle<string>("GET", `/tasks/${encodeURIComponent(taskId)}/audit/report`, null);
+    const token = getToken();
+    const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/audit/report?format=${format}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!r.ok) {
+      let message = `审计报告: ${r.status}`;
+      try {
+        const payload = (await r.json()) as { error?: unknown };
+        if (typeof payload.error === "string" && payload.error.trim()) message = payload.error.trim();
+      } catch {
+        // 409/non-JSON 保持状态码兜底。
+      }
+      throw new Error(message);
+    }
+    return r.text();
+  },
+  // 报告接口需要 Bearer，静态站点不能直接 <a href> 下载，统一 fetch → blob。
+  downloadAuditReport: async (taskId: string, format: "md" | "json" = "md") => {
+    let blob: Blob;
+    let filename = `audit-report.${format === "md" ? "md" : "json"}`;
+    if (MOCK) {
+      const text = await mockHandle<string>("GET", `/tasks/${encodeURIComponent(taskId)}/audit/report`, null);
+      blob = new Blob([text], { type: format === "md" ? "text/markdown;charset=utf-8" : "application/json" });
+    } else {
+      const token = getToken();
+      const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/audit/report?format=${format}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!r.ok) {
+        let message = `审计报告: ${r.status}`;
+        try {
+          const payload = (await r.json()) as { error?: unknown };
+          if (typeof payload.error === "string" && payload.error.trim()) message = payload.error.trim();
+        } catch {
+          // keep fallback
+        }
+        throw new Error(message);
+      }
+      blob = await r.blob();
+      const disposition = r.headers.get("Content-Disposition") ?? "";
+      const match = disposition.match(/filename="?([^";]+)"?/i);
+      if (match?.[1]) filename = match[1];
+    }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
   createTask: (input: {
     name?: string;
     categoryId?: number;
     description: string;
     goal: string;
+    taskMode?: TaskMode;
+    audit?: AuditConfig;
     llmProfileIds?: number[];
     sourceTaskIds?: string[];
     companyIds?: number[];
@@ -266,6 +337,8 @@ export const api = {
       category_id: input.categoryId ?? null,
       description: input.description,
       goal: input.goal,
+      ...(input.taskMode ? { task_mode: input.taskMode } : {}),
+      ...(input.audit ? { audit: input.audit } : {}),
       llm_profile_ids: input.llmProfileIds ?? [],
       source_task_ids: input.sourceTaskIds ?? [],
       company_ids: input.companyIds ?? [],

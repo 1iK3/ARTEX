@@ -213,7 +213,15 @@ export function FindingsTable({
                       <span className="truncate font-medium">{f.name || f.vulnclass || "未分类"}</span>
                     )}
                     <span className="truncate text-xs text-muted-foreground">{f.summary}</span>
-                    <Badge variant="outline">流量证据 {f.traffic_count ?? 0} 条</Badge>
+                    <span className="flex flex-wrap items-center gap-1">
+                      {f.cwe_id && <Badge variant="outline">{f.cwe_id}</Badge>}
+                      {f.verification && f.verification !== "unverified" && (
+                        <Badge variant="secondary">
+                          {f.verification === "confirmed" ? "已验证" : f.verification === "candidate" ? "候选" : f.verification}
+                        </Badge>
+                      )}
+                      <Badge variant="outline">流量证据 {f.traffic_count ?? 0} 条</Badge>
+                    </span>
                   </div>
                 </TableCell>
                 <TableCell>
@@ -383,6 +391,21 @@ export function FindingsTable({
                           </span>
                         )}
                         {f.param_id && <code className="rounded bg-muted px-1.5 py-0.5 font-mono">{f.param_id}</code>}
+                        {f.cwe_id && (
+                          <span>
+                            · CWE：<code className="rounded bg-muted px-1.5 py-0.5 font-mono">{f.cwe_id}</code>
+                          </span>
+                        )}
+                        {f.code_path && (
+                          <span>
+                            · 代码位置：
+                            <code className="rounded bg-muted px-1.5 py-0.5 font-mono">
+                              {f.code_path}
+                              {f.code_line ? `:${f.code_line}` : ""}
+                              {f.code_symbol ? ` · ${f.code_symbol}` : ""}
+                            </code>
+                          </span>
+                        )}
                         {f.assets && f.assets.length > 0 && (
                           <span className="flex flex-wrap items-center gap-1">
                             · 资产：

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Autumn-27/artex/audit"
 	"github.com/Autumn-27/artex/db"
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
@@ -107,6 +108,23 @@ type ToolSet struct {
 	// the planner having to spot it folded into the graph overview. Wired for the main
 	// agent + cross-task orchestration; nil elsewhere → falls back to the bare notify.
 	notifyHint func(texts []string)
+
+	// --- code-audit mode ---
+	// auditMode marks this ToolSet as belonging to the curated code-audit surface.
+	// The surface is enforced by the tool list built in AuditWorkerTools/
+	// AuditPlannerTools: no SDK defaults, no shell/network/source-write tools.
+	auditMode bool
+	// auditDeps is the server-implemented persistence/engine facade. nil = the
+	// audit write/progress tools report an actionable unavailable error.
+	auditDeps AuditDeps
+	// auditCodeGraph is the task-scoped CodeGraph client. nil = codegraph tools
+	// are unavailable and (if enabled) code_search/code_read are offered instead.
+	auditCodeGraph AuditCodeGraph
+	// auditSourceRoot is the read-only source snapshot root used by the fallback
+	// code_search/code_read tools.
+	auditSourceRoot string
+	// auditFallback advertises code_search/code_read even when CodeGraph exists.
+	auditFallback bool
 }
 
 // SetNotifyGoal wires the goal-add trigger callback (see ToolSet.notifyGoal). Set only
@@ -129,6 +147,22 @@ func (t *ToolSet) SetNotify(fn func()) { t.notify = fn }
 // SetNotifyFinding wires the finding-wake callback (see ToolSet.notifyFinding).
 func (t *ToolSet) SetNotifyFinding(fn func(int64, string)) { t.notifyFinding = fn }
 
+// SetAuditMode marks the ToolSet as a curated code-audit surface.
+func (t *ToolSet) SetAuditMode(enabled bool) { t.auditMode = enabled }
+
+// SetAuditDeps wires the server-implemented audit persistence/engine facade.
+func (t *ToolSet) SetAuditDeps(deps AuditDeps) { t.auditDeps = deps }
+
+// SetAuditCodeGraph wires the task-scoped CodeGraph client.
+func (t *ToolSet) SetAuditCodeGraph(graph AuditCodeGraph) { t.auditCodeGraph = graph }
+
+// SetAuditSourceRoot sets the read-only source snapshot root for code_search/
+// code_read fallback tools.
+func (t *ToolSet) SetAuditSourceRoot(root string) { t.auditSourceRoot = root }
+
+// SetAuditFallback enables code_search/code_read even when CodeGraph is present.
+func (t *ToolSet) SetAuditFallback(enabled bool) { t.auditFallback = enabled }
+
 // EnrichTrigger is the enrichment engine seen from the tool layer (see package
 // enrich). Kept as an interface here to avoid coupling agent → enrich.
 type EnrichTrigger interface {
@@ -140,19 +174,37 @@ type EnrichTrigger interface {
 // engine can log an accurate "wrote back" summary instead of lumping assets and
 // findings under "facts" (record_fact → Facts, insert_assets → Assets,
 // report_finding → Findings; each element of a batch counts once).
+//
+// The audit counters make code-audit write-backs visible to the "explored but
+// persisted nothing" check: a worker whose only output is a verified/refuted
+// finding, hypotheses, coverage receipts or artifacts must not be treated as
+// no-output.
 type WriteCounts struct {
 	Facts    int
 	Assets   int
 	Findings int
+
+	// Code-audit counters.
+	Verifications int // update_finding_verification calls
+	Hypotheses    int // audit_hypothesis calls
+	Coverage      int // audit_intent_complete receipts (a completion counts >= 1)
+	Artifacts     int // audit_artifact_write calls
 }
 
-// Total is every node persisted this run, regardless of kind — the
+// Total is every node/state persisted this run, regardless of kind — the
 // "explored but persisted nothing" signal (Total == 0).
-func (w WriteCounts) Total() int { return w.Facts + w.Assets + w.Findings }
+func (w WriteCounts) Total() int {
+	return w.Facts + w.Assets + w.Findings + w.Verifications + w.Hypotheses + w.Coverage + w.Artifacts
+}
 
 // String renders the per-kind breakdown for logs, e.g. "事实1 资产25 漏洞0".
+// Audit counters are appended only when present so pentest log lines stay stable.
 func (w WriteCounts) String() string {
-	return fmt.Sprintf("事实%d 资产%d 漏洞%d", w.Facts, w.Assets, w.Findings)
+	base := fmt.Sprintf("事实%d 资产%d 漏洞%d", w.Facts, w.Assets, w.Findings)
+	if w.Verifications+w.Hypotheses+w.Coverage+w.Artifacts == 0 {
+		return base
+	}
+	return base + fmt.Sprintf(" 复核%d 假设%d 覆盖%d 产物%d", w.Verifications, w.Hypotheses, w.Coverage, w.Artifacts)
 }
 
 // Writes reports what this run wrote back, split by node kind (so the engine can
@@ -1023,13 +1075,15 @@ type intentItem struct {
 	AssetIDs  []json.RawMessage `json:"asset_ids"`
 	ParentIDs []json.RawMessage `json:"parent_ids"`
 	Priority  int               `json:"priority"`
+	// Audit is optional code-audit metadata. Pentest intents omit it.
+	Audit *auditIntentSpec `json:"audit,omitempty"`
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
 // 约束：意图只能锚在已确认知识上——每个 parent_id 必须是已存在的 fact/finding
 // 节点（不能挂在别的意图/目标/提示上）。顶层全新方向留空 parent_ids，兜底连 origin fact。
 // 这样"每个意图都连到 fact 节点、且是发现驱动而非凭空规划"从创建路径上被强制。
-func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
+func (t *ToolSet) addOneIntent(ctx context.Context, it intentItem) (int64, error) {
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
 	}
@@ -1064,13 +1118,54 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 			return 0, fmt.Errorf("%s", b.String())
 		}
 	}
+	if t.auditMode {
+		if it.Audit == nil || strings.TrimSpace(it.Audit.Phase) == "" || it.Audit.Round <= 0 {
+			return 0, fmt.Errorf("代码审计任务的意图必须提供 audit.phase 和正整数 audit.round")
+		}
+		if t.taskID <= 0 || t.auditDeps == nil {
+			return 0, fmt.Errorf("代码审计意图需要审计会话上下文（task_id/audit deps 未接入）")
+		}
+	}
+	normalizedAudit, err := normalizeAuditIntentSpec(it.Audit)
+	if err != nil {
+		return 0, err
+	}
+	if t.auditMode {
+		if normalizedAudit.Phase == audit.PhaseReport {
+			return 0, fmt.Errorf("S11 报告阶段由服务端生成，规划者不能创建 S11 意图")
+		}
+		currentRound, err := t.auditDeps.CurrentAuditRound(ctx, t.taskID)
+		if err != nil {
+			return 0, fmt.Errorf("读取当前审计轮次失败: %w", err)
+		}
+		if normalizedAudit.Round != currentRound {
+			return 0, fmt.Errorf("审计意图轮次 %d 与当前会话轮次 %d 不一致", normalizedAudit.Round, currentRound)
+		}
+	}
 	payload := map[string]any{"summary": it.Summary}
 	if len(anchors) > 0 {
 		payload["asset_ids"] = anchors
 	}
+	if normalizedAudit != nil {
+		payload["audit"] = normalizedAudit
+	}
 	id, err := t.ts.AddIntent(payload, priority, anchors, "planner")
 	if err != nil {
 		return 0, err
+	}
+	if normalizedAudit != nil && len(normalizedAudit.SinkKeys) > 0 {
+		if t.auditDeps == nil {
+			_ = t.softDeleteIntentQuietly(id, "audit coverage claim unavailable")
+			return 0, fmt.Errorf("审计意图声明了 sink_keys，但当前 ToolSet 未接入审计持久化服务")
+		}
+		if t.taskID <= 0 {
+			_ = t.softDeleteIntentQuietly(id, "audit coverage claim missing task")
+			return 0, fmt.Errorf("审计意图声明了 sink_keys，但缺少任务上下文")
+		}
+		if err := t.auditDeps.ClaimAuditCoverage(ctx, t.taskID, id, normalizedAudit.SinkKeys); err != nil {
+			_ = t.softDeleteIntentQuietly(id, "audit coverage claim failed")
+			return 0, fmt.Errorf("认领审计覆盖行失败: %w", err)
+		}
 	}
 	// upstream lineage: link each (validated) fact/finding parent → this intent, so
 	// "multiple facts combine into one new intent" is expressible.
@@ -1088,8 +1183,17 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	return id, nil
 }
 
+func (t *ToolSet) softDeleteIntentQuietly(id int64, reason string) error {
+	if t == nil || t.ts == nil || id <= 0 {
+		return nil
+	}
+	_, err := t.ts.SoftDeleteIntent(id, reason)
+	return err
+}
+
 func (t *ToolSet) addIntent() actool.CoreTool {
 	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
+		"【代码审计】必须传 audit 对象且轮次等于当前会话轮次；S11 由服务端生成报告，禁止创建。S4 必须带非空 sink_keys（来自 audit_progress.candidates），服务端会原子认领这些覆盖行，未知/已被认领/轮次不匹配会失败，失败意图会被回收。S5/S8 验证意图可从 candidates 原样复制 finding_ids，不需要 sink_keys（S5/S8 允许无 sink keys）。\n"+
 		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
 		obj(map[string]any{
 			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
@@ -1097,8 +1201,32 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
 			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
 			"priority":   intp("优先级 0-10，默认5"),
+			"audit": map[string]any{
+				"type":        "object",
+				"description": "【仅代码审计任务】审计意图元数据。用于阶段门禁、按轮次统计和 sink 覆盖分配；普通渗透任务省略。",
+				"properties": map[string]any{
+					"phase":    map[string]any{"type": "string", "description": "审计阶段 S1-S10（如 S4）；S11 报告由服务端生成，禁止创建"},
+					"round":    map[string]any{"type": "integer", "minimum": 1, "maximum": 10, "description": "审计轮次；必须与 audit_progress.session.round 对齐"},
+					"cwe":      map[string]any{"type": "string", "description": "目标 CWE（可选，如 CWE-89）"},
+					"language": map[string]any{"type": "string", "description": "目标语言（可选，如 go/java/python）"},
+					"scope":    map[string]any{"type": "object", "description": "范围对象（可选），常用 {modules:[...]}"},
+					"sink_keys": map[string]any{
+						"type": "array", "items": map[string]any{"type": "string"},
+						"description": "本次意图负责的 sink_key 列表（S4 必填；来自 audit_progress.candidates 或 audit_assigned_coverage；S5/S8 可省略）",
+					},
+					"finding_ids": map[string]any{
+						"type": "array", "items": map[string]any{"type": "integer"},
+						"description": "S5/S8 验证意图要复核的发现 ID（来自 audit_progress.candidates[].finding_ids，每批最多 5 个）",
+					},
+					"deliverables": map[string]any{
+						"type": "array", "items": map[string]any{"type": "string"},
+						"description": "期望产出（可选）",
+					},
+				},
+				"required": []string{"phase", "round"},
+			},
 		}),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Intents    []intentItem `json:"intents"`
 				intentItem              // 单条模式：顶层 summary/asset_ids/parent_ids/priority
@@ -1114,7 +1242,7 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			errs := map[string]string{}
 			createdAny := false
 			for i, it := range items {
-				id, err := t.addOneIntent(it)
+				id, err := t.addOneIntent(ctx, it)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue
@@ -1161,13 +1289,16 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			"evidence_id": idp("证明它的发现/事实节点 id"),
 			"reason":      str("为什么这个证据满足该目标"),
 		}, "goal_id", "evidence_id"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				GoalID     json.RawMessage `json:"goal_id"`
 				EvidenceID json.RawMessage `json:"evidence_id"`
 				Reason     string          `json:"reason"`
 			}
 			_ = json.Unmarshal(in, &a)
+			if err := t.requireAuditConverged(ctx, "prove_goal"); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
 			goal, ev := pid(a.GoalID), pid(a.EvidenceID)
 			if goal == 0 || ev == 0 {
 				return actool.Errorf("goal_id 和 evidence_id 必填"), nil
@@ -1205,9 +1336,12 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 func (t *ToolSet) goalMet() actool.CoreTool {
 	return writeTool("goal_met", "【立即结束整个任务】——仅当你确认任务的【全部目标都已真正达成、整体收官】时才调（注意是任务【整体】完成；仅仅达成了其中某一个目标/某一个 flag/某一个漏洞【不算】——那种情况用 prove_goal 标记该目标即可）。⚠️它不是用来“结束本轮规划”的：本轮没有新意图要派、或在等 worker 产出，都【直接结束本轮即可，不要调本工具】（0 个意图是完全正常的）。正常判定优先用 prove_goal 逐个证明目标；goal_met 只是绕过逐个证明、直接从全局收官的手段。",
 		obj(map[string]any{"reason": str("达成理由（必须是目标真正达成的证据，不能是“本轮无新方向”这类结束本轮的理由）")}, "reason"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct{ Reason string }
 			_ = json.Unmarshal(in, &a)
+			if err := t.requireAuditConverged(ctx, "goal_met"); err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
 			t.GoalMet = true
 			t.Reason = a.Reason
 			return actool.Text("acknowledged: goal marked met"), nil

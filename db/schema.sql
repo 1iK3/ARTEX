@@ -620,12 +620,17 @@ CREATE TABLE IF NOT EXISTS task_templates (
     category_id     BIGINT REFERENCES task_categories(id) ON DELETE SET NULL,
     -- 预设的任务级拦截/允许规则快照(AssetInterceptRuleInput 数组)；应用模板时灌进新任务。
     intercept_rules JSONB NOT NULL DEFAULT '[]',
+    -- 任务执行模式与创建时冻结的审计配置(仅 code_audit 使用)。
+    task_mode      TEXT NOT NULL DEFAULT 'pentest',
+    audit_config   JSONB NOT NULL DEFAULT '{}',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- 补旧库(已发版,加列带 IF NOT EXISTS)。
 ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS category_id BIGINT REFERENCES task_categories(id) ON DELETE SET NULL;
 ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS intercept_rules JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS task_mode TEXT NOT NULL DEFAULT 'pentest';
+ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS audit_config JSONB NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS idx_task_templates_updated ON task_templates(updated_at DESC, id DESC);
 DROP TRIGGER IF EXISTS trg_task_templates_upd ON task_templates;
 CREATE TRIGGER trg_task_templates_upd BEFORE UPDATE ON task_templates
@@ -1384,3 +1389,233 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
     ON notification_deliveries(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
     ON notification_deliveries(channel_id, id DESC);
+
+-- ===================== Code Audit =====================
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS task_mode TEXT NOT NULL DEFAULT 'pentest';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS audit_config JSONB NOT NULL DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_tasks_task_mode
+  ON tasks(task_mode, created_at DESC) WHERE deleted_at IS NULL;
+
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS cwe_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS code_path TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS code_line INT NOT NULL DEFAULT 0;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS code_symbol TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS confidence REAL NOT NULL DEFAULT 0;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS verification TEXT NOT NULL DEFAULT 'unverified';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS dedupe_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS code_evidence JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS audit_round INT NOT NULL DEFAULT 0;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS audit_phase TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_findings_task_dedupe
+  ON findings(task_id, dedupe_key) WHERE dedupe_key <> '';
+CREATE INDEX IF NOT EXISTS idx_findings_cwe
+  ON findings(task_id, cwe_id, severity);
+CREATE INDEX IF NOT EXISTS idx_findings_verification
+  ON findings(task_id, verification);
+
+CREATE TABLE IF NOT EXISTS audit_sessions (
+  id BIGSERIAL PRIMARY KEY,
+  task_id BIGINT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'ingest',
+  source_type TEXT NOT NULL,
+  source_ref TEXT NOT NULL DEFAULT '',
+  snapshot_path TEXT NOT NULL DEFAULT '',
+  commit_sha TEXT NOT NULL DEFAULT '',
+  repo_asset_id BIGINT REFERENCES assets(id) ON DELETE SET NULL,
+  depth TEXT NOT NULL DEFAULT 'deep',
+  backend TEXT NOT NULL DEFAULT 'codegraph',
+  languages TEXT[] NOT NULL DEFAULT '{}',
+  engines JSONB NOT NULL DEFAULT '{}',
+  plan JSONB NOT NULL DEFAULT '{}',
+  round INT NOT NULL DEFAULT 1,
+  max_rounds INT NOT NULL DEFAULT 5,
+  gate_results JSONB NOT NULL DEFAULT '{}',
+  stats JSONB NOT NULL DEFAULT '{}',
+  report_md TEXT NOT NULL DEFAULT '',
+  report_json JSONB NOT NULL DEFAULT '{}',
+  started_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_audit_sessions_status
+  ON audit_sessions(status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS audit_phases (
+  id BIGSERIAL PRIMARY KEY,
+  session_id BIGINT NOT NULL REFERENCES audit_sessions(id) ON DELETE CASCADE,
+  round INT NOT NULL,
+  phase TEXT NOT NULL,
+  required BOOLEAN NOT NULL DEFAULT true,
+  status TEXT NOT NULL DEFAULT 'pending',
+  gate JSONB NOT NULL DEFAULT '{}',
+  stats JSONB NOT NULL DEFAULT '{}',
+  started_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  UNIQUE(session_id, round, phase)
+);
+
+CREATE TABLE IF NOT EXISTS audit_coverage (
+  id BIGSERIAL PRIMARY KEY,
+  session_id BIGINT NOT NULL REFERENCES audit_sessions(id) ON DELETE CASCADE,
+  round INT NOT NULL,
+  kind TEXT NOT NULL,
+  language TEXT NOT NULL DEFAULT '',
+  cwe TEXT NOT NULL DEFAULT '',
+  module TEXT NOT NULL DEFAULT '',
+  path TEXT NOT NULL DEFAULT '',
+  line INT NOT NULL DEFAULT 0,
+  symbol TEXT NOT NULL DEFAULT '',
+  sink_key TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'planned',
+  -- audit_detection_intents.id (not audit_coverage.id). Intentionally no FK:
+  -- coverage can be planned before an intent exists and may be re-pointed.
+  intent_id BIGINT,
+  engine TEXT NOT NULL DEFAULT '',
+  evidence JSONB NOT NULL DEFAULT '{}',
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(session_id, round, kind, sink_key)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_cov_session_status
+  ON audit_coverage(session_id, round, status);
+CREATE INDEX IF NOT EXISTS idx_audit_cov_cwe
+  ON audit_coverage(session_id, round, cwe, status);
+
+CREATE TABLE IF NOT EXISTS audit_detection_intents (
+  id BIGSERIAL PRIMARY KEY,
+  session_id BIGINT NOT NULL REFERENCES audit_sessions(id) ON DELETE CASCADE,
+  round INT NOT NULL,
+  intent_key TEXT NOT NULL,
+  origin TEXT NOT NULL,
+  language TEXT NOT NULL DEFAULT '',
+  cwe TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL DEFAULT '',
+  query_kind TEXT NOT NULL DEFAULT 'sink',
+  sources JSONB NOT NULL DEFAULT '[]',
+  sinks JSONB NOT NULL DEFAULT '[]',
+  sanitizers JSONB NOT NULL DEFAULT '[]',
+  propagators JSONB NOT NULL DEFAULT '[]',
+  scope JSONB NOT NULL DEFAULT '{}',
+  constraints JSONB NOT NULL DEFAULT '{}',
+  preferred_engines JSONB NOT NULL DEFAULT '[]',
+  priority INT NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'planned',
+  error TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(session_id, round, intent_key)
+);
+
+CREATE TABLE IF NOT EXISTS audit_hypotheses (
+  id BIGSERIAL PRIMARY KEY,
+  session_id BIGINT NOT NULL REFERENCES audit_sessions(id) ON DELETE CASCADE,
+  round INT NOT NULL,
+  hypothesis_key TEXT NOT NULL,
+  statement TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'untested',
+  attempts JSONB NOT NULL DEFAULT '[]',
+  evidence TEXT NOT NULL DEFAULT '',
+  priority INT NOT NULL DEFAULT 5,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(session_id, hypothesis_key)
+);
+
+CREATE TABLE IF NOT EXISTS audit_rounds (
+  id BIGSERIAL PRIMARY KEY,
+  session_id BIGINT NOT NULL REFERENCES audit_sessions(id) ON DELETE CASCADE,
+  round INT NOT NULL,
+  new_findings INT NOT NULL DEFAULT 0,
+  new_confirmed INT NOT NULL DEFAULT 0,
+  new_candidate INT NOT NULL DEFAULT 0,
+  total_findings INT NOT NULL DEFAULT 0,
+  gate_c TEXT NOT NULL DEFAULT '',
+  gate_cwe TEXT NOT NULL DEFAULT '',
+  gate_h TEXT NOT NULL DEFAULT '',
+  gate_e TEXT NOT NULL DEFAULT '',
+  gate_coverage TEXT NOT NULL DEFAULT '',
+  gate_engine TEXT NOT NULL DEFAULT '',
+  decision TEXT NOT NULL DEFAULT '',
+  focus JSONB NOT NULL DEFAULT '{}',
+  token_usage JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(session_id, round)
+);
+
+CREATE TABLE IF NOT EXISTS audit_engine_jobs (
+  id BIGSERIAL PRIMARY KEY,
+  session_id BIGINT NOT NULL REFERENCES audit_sessions(id) ON DELETE CASCADE,
+  -- audit_detection_intents.id; nullable for ad-hoc engine queries.
+  intent_id BIGINT REFERENCES audit_detection_intents(id) ON DELETE CASCADE,
+  engine TEXT NOT NULL,
+  job_kind TEXT NOT NULL,
+  query_hash TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  query_text TEXT NOT NULL DEFAULT '',
+  query_path TEXT NOT NULL DEFAULT '',
+  artifact_path TEXT NOT NULL DEFAULT '',
+  result_count INT NOT NULL DEFAULT 0,
+  duration_ms BIGINT NOT NULL DEFAULT 0,
+  error TEXT NOT NULL DEFAULT '',
+  sarif JSONB NOT NULL DEFAULT '{}',
+  provenance JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- NULLS NOT DISTINCT (PostgreSQL 15+) makes nil-intent jobs conflict on the
+-- natural key instead of accumulating duplicate rows. The guard also replaces
+-- the earlier NULLS DISTINCT constraint on databases initialized mid-task.
+DO $$
+DECLARE c record;
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'audit_engine_jobs'::regclass
+      AND conname = 'uq_audit_engine_jobs_key'
+  ) THEN
+    -- Drop any earlier auto-named NULLS DISTINCT unique constraint on this
+    -- table (identifier truncation makes guessing its exact name fragile).
+    FOR c IN
+      SELECT conname FROM pg_constraint
+      WHERE conrelid = 'audit_engine_jobs'::regclass AND contype = 'u'
+    LOOP
+      EXECUTE format('ALTER TABLE audit_engine_jobs DROP CONSTRAINT IF EXISTS %I', c.conname);
+    END LOOP;
+    EXECUTE 'ALTER TABLE audit_engine_jobs ADD CONSTRAINT uq_audit_engine_jobs_key UNIQUE NULLS NOT DISTINCT (session_id, intent_id, engine, job_kind, query_hash)';
+  END IF;
+END $$;
+
+-- Add repository to the assets.type CHECK. The whole migration is skipped once
+-- the named check exists and admits 'repository', so repeated startup is a no-op
+-- and never drops/recreates the constraint. The loop only matches the original
+-- six-value asset-type CHECK; matching every constraint containing the word
+-- "type" would also drop service_type's CHECK.
+DO $$
+DECLARE c record;
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'assets'::regclass
+      AND conname = 'assets_type_check'
+      AND pg_get_constraintdef(oid) LIKE '%repository%'
+  ) THEN
+    RETURN;
+  END IF;
+  FOR c IN
+    SELECT conname FROM pg_constraint
+    WHERE conrelid = 'assets'::regclass AND contype = 'c'
+      AND pg_get_constraintdef(oid) LIKE '%''root_domain''%'
+      AND pg_get_constraintdef(oid) LIKE '%''subdomain''%'
+      AND pg_get_constraintdef(oid) LIKE '%''endpoint''%'
+  LOOP
+    EXECUTE format('ALTER TABLE assets DROP CONSTRAINT IF EXISTS %I', c.conname);
+  END LOOP;
+  -- A partial previous run may leave the named constraint without 'repository';
+  -- replace it before re-adding under the same name.
+  EXECUTE 'ALTER TABLE assets DROP CONSTRAINT IF EXISTS assets_type_check';
+  EXECUTE 'ALTER TABLE assets ADD CONSTRAINT assets_type_check CHECK (type IN (''root_domain'',''ip'',''subdomain'',''app'',''service'',''endpoint'',''repository''))';
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
+  ON assets(url) WHERE type = 'repository';

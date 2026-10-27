@@ -65,6 +65,11 @@ function Row({
           <div className="flex min-w-0 flex-1 flex-col gap-1">
             <div className="flex min-w-0 items-center gap-2">
               <span className="truncate font-medium">{findingLabel(f)}</span>
+              {f.cwe_id && (
+                <Badge variant="outline" className="shrink-0">
+                  {f.cwe_id}
+                </Badge>
+              )}
               {f.inherited && f.source_task_id && (
                 <Badge variant="outline" className="shrink-0">
                   来源 #{f.source_task_id} · 只读
@@ -127,7 +132,21 @@ function Row({
       </div>
       {open && (
         <div className="bg-muted/30 px-4 pb-4 pl-11">
-          <div className="mb-1 text-xs font-medium text-muted-foreground">证据 / PoC</div>
+          <div className="mb-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            <span className="font-medium">证据 / PoC</span>
+            {f.verification && f.verification !== "unverified" && (
+              <Badge variant="secondary">
+                {f.verification === "confirmed" ? "已验证" : f.verification === "candidate" ? "候选" : f.verification}
+              </Badge>
+            )}
+            {f.code_path && (
+              <code className="rounded bg-muted px-1.5 py-0.5 font-mono">
+                {f.code_path}
+                {f.code_line ? `:${f.code_line}` : ""}
+                {f.code_symbol ? ` · ${f.code_symbol}` : ""}
+              </code>
+            )}
+          </div>
           <pre className="overflow-auto rounded-md border bg-background p-3 font-mono text-xs whitespace-pre-wrap">
             {f.evidence}
           </pre>

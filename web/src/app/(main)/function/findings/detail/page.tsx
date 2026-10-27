@@ -25,6 +25,7 @@ import { api } from "@/lib/api";
 import { statusMeta } from "@/lib/status";
 import type { Finding, FindingStatus, Severity } from "@/lib/types";
 
+import { CodeEvidenceSection } from "../_components/code-evidence";
 import { FindingLineageView } from "./lineage";
 
 const SEVERITIES: Severity[] = ["critical", "high", "medium", "low"];
@@ -147,6 +148,12 @@ function FindingDetailInner() {
           <Separator orientation="vertical" className="mx-1 h-4" />
           <StatusBadge domain="severity" value={finding.severity} dot />
           <StatusBadge domain="finding" value={finding.status} dot />
+          {finding.cwe_id && <Badge variant="outline">{finding.cwe_id}</Badge>}
+          {finding.verification && (
+            <Badge variant="outline">
+              验证：{finding.verification === "confirmed" ? "已确认" : finding.verification === "candidate" ? "候选" : finding.verification}
+            </Badge>
+          )}
           {finding.inherited && finding.source_task_id && (
             <Badge variant="outline">来源任务 #{finding.source_task_id} · 只读</Badge>
           )}
@@ -172,7 +179,8 @@ function FindingDetailInner() {
                   <p className="text-sm leading-relaxed whitespace-pre-wrap">{finding.summary || "（无摘要）"}</p>
                 </CardContent>
               </Card>
-              <FindingRetestPanel key={id} findingId={id} readOnly={finding.inherited} onCompleted={load} />
+              <FindingRetestPanel key={`retest-${id}`} findingId={id} readOnly={finding.inherited} onCompleted={load} />
+              <CodeEvidenceSection finding={finding} contextTaskId={contextTaskId || undefined} />
               <Card>
                 <CardHeader>
                   <CardTitle className="text-sm">证据 / PoC</CardTitle>
@@ -188,7 +196,7 @@ function FindingDetailInner() {
                 </CardContent>
               </Card>
               <FindingTrafficPanel
-                key={id}
+                key={`traffic-${id}`}
                 findingId={id}
                 contextTask={contextTaskId || undefined}
                 readOnly={finding.inherited}

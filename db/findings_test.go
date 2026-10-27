@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Autumn-27/artex/audit"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // TestDeleteFinding verifies删除漏洞 removes both the findings row and its
@@ -515,5 +518,267 @@ func TestAddFindingFollowUpIntent(t *testing.T) {
 	}
 	if _, _, err := store.AddFindingFollowUpIntent(findingID, findingNodeID, "should fail", auditInput); !errors.Is(err, ErrFindingOriginUnavailable) {
 		t.Fatalf("missing source node: want ErrFindingOriginUnavailable, got %v", err)
+	}
+}
+
+// TestCodeFindingDedupe covers the code-audit persistence path: RecordFindingTx
+// stores the new columns and node payload, and a second record with the same
+// (task_id, dedupe_key) returns the existing finding without adding a node,
+// anchor or notification. AddCodeFinding's ON CONFLICT path is exercised too.
+func TestCodeFindingDedupe(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+
+	tk, err := d.CreateTask("代码审计去重测试", "目标", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = d.Exec(`DELETE FROM notification_events WHERE finding_id IN (SELECT id FROM findings WHERE task_id=$1)`, tk.ID)
+		_, _ = d.Exec(`DELETE FROM findings WHERE task_id=$1`, tk.ID)
+		_ = d.DeleteTask(tk.ID)
+	}()
+
+	const dedupeKey = "CWE-89|src/UserDao.java|42|executeQuery"
+	codeEvidence := json.RawMessage(`{"version":1,"cwe_id":"CWE-89","title":"SQL injection in UserDao.find","severity":"high","confidence":0.86,"dedupe_key":"CWE-89|src/UserDao.java|42|executeQuery"}`)
+	in := RecordFindingInput{
+		TaskID:        tk.ID,
+		ExplorationID: tk.ExplorationID,
+		VulnClass:     "CWE-89",
+		Name:          "SQL injection in UserDao.find",
+		Severity:      "high",
+		Summary:       "tainted query reaches Statement.executeQuery",
+		Evidence:      "poc: ' OR 1=1 --",
+		Worker:        "auditor",
+		CWEID:         "CWE-89",
+		CodePath:      "src/UserDao.java",
+		CodeLine:      42,
+		CodeSymbol:    "Statement.executeQuery",
+		Confidence:    0.5,
+		Verification:  "confirmed",
+		// A mismatched supplied key must be replaced by the canonical
+		// CWE/path/line/symbol key computed by the server.
+		DedupeKey:    "CWE-79|caller/chose/this.go|1|nothing",
+		CodeEvidence: codeEvidence,
+		AuditRound:   2,
+		AuditPhase:   "S5",
+	}
+
+	es := d.Exploration(tk.ExplorationID)
+	first, err := es.RecordFinding(t.Context(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Duplicate {
+		t.Fatal("first record must not be a duplicate")
+	}
+	if first.FindingID <= 0 || first.NodeID <= 0 {
+		t.Fatalf("first record ids: finding=%d node=%d", first.FindingID, first.NodeID)
+	}
+	if first.Traffic == nil {
+		t.Fatal("first record traffic should be initialized")
+	}
+
+	in.Summary = "second attempt must not create anything"
+	second, err := es.RecordFinding(t.Context(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Duplicate {
+		t.Fatal("second record with the same dedupe key must be a duplicate")
+	}
+	if second.FindingID != first.FindingID || second.NodeID != first.NodeID {
+		t.Fatalf("duplicate ids = (%d,%d), want (%d,%d)",
+			second.FindingID, second.NodeID, first.FindingID, first.NodeID)
+	}
+	if second.Traffic == nil {
+		t.Fatal("duplicate record traffic should be loaded")
+	}
+
+	var findingCount, nodeCount, notificationCount int
+	if err := d.QueryRow(`SELECT count(*) FROM findings WHERE task_id=$1 AND dedupe_key=$2`, tk.ID, dedupeKey).Scan(&findingCount); err != nil {
+		t.Fatal(err)
+	}
+	if findingCount != 1 {
+		t.Fatalf("findings rows = %d, want 1", findingCount)
+	}
+	if err := d.QueryRow(`SELECT count(*) FROM exploration_nodes WHERE exploration_id=$1 AND kind='finding'`, tk.ExplorationID).Scan(&nodeCount); err != nil {
+		t.Fatal(err)
+	}
+	if nodeCount != 1 {
+		t.Fatalf("finding nodes = %d, want 1", nodeCount)
+	}
+	if err := d.QueryRow(`SELECT count(*) FROM notification_events WHERE finding_id=$1`, first.FindingID).Scan(&notificationCount); err != nil {
+		t.Fatal(err)
+	}
+	if notificationCount != 1 {
+		t.Fatalf("notification events = %d, want 1", notificationCount)
+	}
+
+	got, err := d.GetFinding(first.FindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("GetFinding returned nil")
+	}
+	if got.CWEID != "CWE-89" || got.CodePath != "src/UserDao.java" || got.CodeLine != 42 ||
+		got.CodeSymbol != "Statement.executeQuery" || got.Confidence != 0.5 || got.Verification != "confirmed" ||
+		got.DedupeKey != dedupeKey || got.AuditRound != 2 || got.AuditPhase != "S5" {
+		t.Fatalf("code fields not round-tripped: %+v", got)
+	}
+	var storedEvidence map[string]any
+	if err := json.Unmarshal(got.CodeEvidence, &storedEvidence); err != nil {
+		t.Fatalf("stored code_evidence is not an object: %v (%s)", err, got.CodeEvidence)
+	}
+	if storedEvidence["cwe_id"] != "CWE-89" {
+		t.Fatalf("stored code_evidence cwe_id = %v", storedEvidence["cwe_id"])
+	}
+
+	// Both list scanners must select the new columns.
+	list, err := d.ListFindings(500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listed *DBFinding
+	for _, f := range list {
+		if f.ID == first.FindingID {
+			listed = f
+			break
+		}
+	}
+	if listed == nil {
+		t.Fatal("finding missing from ListFindings")
+	}
+	if listed.CodePath != "src/UserDao.java" || listed.Verification != "confirmed" || len(listed.CodeEvidence) == 0 {
+		t.Fatalf("ListFindings lost code fields: %+v", listed)
+	}
+	exported, err := d.ListFindingsForExport(FindingFilter{}, []int64{first.FindingID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exported) != 1 || exported[0].CodeSymbol != "Statement.executeQuery" || exported[0].AuditPhase != "S5" {
+		t.Fatalf("ListFindingsForExport lost code fields: %+v", exported)
+	}
+
+	// The exploration node payload carries the code fields for the per-task view.
+	var payloadRaw []byte
+	if err := d.QueryRow(`SELECT payload FROM exploration_nodes WHERE id=$1`, first.NodeID).Scan(&payloadRaw); err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(payloadRaw, &payload); err != nil {
+		t.Fatalf("node payload: %v", err)
+	}
+	for key, want := range map[string]any{
+		"vulnclass":    "CWE-89",
+		"name":         "SQL injection in UserDao.find",
+		"severity":     "high",
+		"cwe_id":       "CWE-89",
+		"code_path":    "src/UserDao.java",
+		"code_line":    float64(42),
+		"code_symbol":  "Statement.executeQuery",
+		"confidence":   float64(0.5),
+		"verification": "confirmed",
+		"dedupe_key":   dedupeKey,
+		"audit_round":  float64(2),
+		"audit_phase":  "S5",
+	} {
+		if payload[key] != want {
+			t.Fatalf("node payload[%q] = %v, want %v", key, payload[key], want)
+		}
+	}
+	evidence, ok := payload["evidence"].(map[string]any)
+	if !ok || evidence["by"] != "auditor" || evidence["poc"] != "poc: ' OR 1=1 --" {
+		t.Fatalf("node payload evidence = %#v", payload["evidence"])
+	}
+	if _, ok := payload["code_evidence"].(map[string]any); !ok {
+		t.Fatalf("node payload code_evidence = %#v", payload["code_evidence"])
+	}
+
+	// AddCodeFinding uses the same unique key semantics without touching the graph.
+	const directKey = "CWE-79|src/View.java|9|render"
+	direct := CodeFindingInput{
+		TaskID:       tk.ID,
+		CWEID:        "CWE-79",
+		Title:        "Reflected XSS",
+		Severity:     "medium",
+		Summary:      "unescaped output",
+		Evidence:     "poc",
+		Worker:       "auditor",
+		CodePath:     "src/View.java",
+		CodeLine:     9,
+		CodeSymbol:   "View.render",
+		Confidence:   0.4,
+		Verification: "candidate",
+		DedupeKey:    "not-the-canonical-key",
+		CodeEvidence: json.RawMessage(`{"version":1,"cwe_id":"CWE-79"}`),
+		AuditRound:   1,
+		AuditPhase:   "S4",
+	}
+	directID, duplicate, err := d.AddCodeFinding(direct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate || directID <= 0 {
+		t.Fatalf("AddCodeFinding first: id=%d duplicate=%v", directID, duplicate)
+	}
+	// An empty supplied key still dedupes on the server-computed key.
+	direct.DedupeKey = ""
+	againID, duplicate, err := d.AddCodeFinding(direct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !duplicate || againID != directID {
+		t.Fatalf("AddCodeFinding duplicate: id=%d duplicate=%v, want id=%d duplicate=true", againID, duplicate, directID)
+	}
+	directRow, err := d.GetFinding(directID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if directRow == nil || directRow.VulnClass != "CWE-79" || directRow.Name != "Reflected XSS" ||
+		directRow.Verification != "candidate" || directRow.CodeSymbol != "View.render" ||
+		directRow.DedupeKey != directKey {
+		t.Fatalf("AddCodeFinding row not round-tripped: %+v", directRow)
+	}
+}
+
+// TestCodeFindingPersistenceHelpers covers the DB-free helpers used by the
+// code-finding write paths.
+func TestCodeFindingPersistenceHelpers(t *testing.T) {
+	empty, err := persistedCodeEvidence(nil)
+	if err != nil || string(empty) != "{}" {
+		t.Fatalf("empty code evidence = %s, err=%v", empty, err)
+	}
+	if _, err := persistedCodeEvidence(json.RawMessage(`{"version":1`)); err == nil {
+		t.Fatal("invalid code evidence JSON must be rejected")
+	}
+	oversized := json.RawMessage(`"` + strings.Repeat("x", audit.MaxCodeEvidenceBytes) + `"`)
+	if _, err := persistedCodeEvidence(oversized); !errors.Is(err, audit.ErrCodeEvidenceTooLarge) {
+		t.Fatalf("oversized code evidence error = %v, want ErrCodeEvidenceTooLarge", err)
+	}
+
+	// Code identity always wins over the caller-supplied dedupe key; findings
+	// without code identity keep the legacy key.
+	if got := codeFindingDedupeKey("CWE-89", `src\A.java`, 42, "Statement.executeQuery", "bogus"); got != "CWE-89|src/A.java|42|executeQuery" {
+		t.Fatalf("canonical dedupe key = %q", got)
+	}
+	if got := codeFindingDedupeKey("CWE-89", "src/A.java", 42, "executeQuery", ""); got != "CWE-89|src/A.java|42|executeQuery" {
+		t.Fatalf("empty supplied key was not recomputed: %q", got)
+	}
+	if got := codeFindingDedupeKey("", "", 0, "", " legacy-key "); got != "legacy-key" {
+		t.Fatalf("pentest dedupe key = %q, want legacy-key", got)
+	}
+	if !isUniqueViolation(&pgconn.PgError{Code: "23505"}) {
+		t.Fatal("23505 must be recognized as a unique violation")
+	}
+	if isUniqueViolation(&pgconn.PgError{Code: "40P01"}) {
+		t.Fatal("non-unique pg error must not be treated as a duplicate")
+	}
+	if isUniqueViolation(errors.New("unique")) {
+		t.Fatal("non-pg error must not be treated as a duplicate")
 	}
 }

@@ -207,6 +207,13 @@ var builtinAgents = []builtinAgent{
 		{"ProxyAddr", "记录代理地址(驱动 if 双文案)", "127.0.0.1:8080", "runtime"},
 		{"WorkerName", "worker 自我标识(可选)", "worker-1", "runtime"},
 	}, false, nil},
+	// Code-audit roles. They are independent builtin agents (not variants of
+	// planner/worker) so their prompts, tool bindings and LLM bindings can be
+	// managed separately; the task mode selects them per task.
+	{"code_planner", "代码审计规划", "planner", "读取审计进度/门禁/候选并派发代码审计意图；只调度与判目标，不读代码。", []promptVar{
+		{"Goal", "审计任务总目标", "完成对 example 仓库的全量深度代码审计", "exploration"},
+	}, false, nil},
+	{"code_worker", "代码审计执行", "worker", "执行一条代码审计意图：用 CodeGraph 分析并写回结构化证据、假设与覆盖回执。", nil, false, nil},
 	// Auto:内置「平台操作」agent。不参与渗透编排循环,经对话页驱动,用工具操作平台。
 	{"auto", "Auto", "assistant", "平台操作助手：用工具管理任务(建/看/暂停/给提示)与资产，并可创建/修改 skill、自定义工具、MCP。", nil, false, nil},
 	// 渗透测试:内置「独立渗透」agent。经对话页驱动,一人从侦察到收尾走完整条渗透链,自己规划自己执行自己验证。默认开启交互式 shell。

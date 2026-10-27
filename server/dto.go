@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Autumn-27/artex/audit"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/traffic"
 )
@@ -60,7 +61,9 @@ type TaskDTO struct {
 	SourceTaskIDs      []string           `json:"source_task_ids"`
 	ArchiveBlockedBy   string             `json:"archive_blocked_by_task_id,omitempty"`
 	CompanyIDs         []int64            `json:"company_ids"`
-	CoverageEnabled    bool               `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
+	CoverageEnabled    bool               `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定)
+	TaskMode           string             `json:"task_mode"`              // pentest | code_audit；老任务默认 pentest
+	AuditConfig        json.RawMessage    `json:"audit_config,omitempty"` // 仅 code_audit；创建时冻结的审计配置
 }
 
 // FindingSeverityDTO 是任务列表里按严重度分档的漏洞计数（严重/高/中/低）。
@@ -109,6 +112,14 @@ func taskDTO(t *Task, status string) TaskDTO {
 		sourceIDs = append(sourceIDs, i64s(id))
 	}
 	profileIDs := append(make([]int64, 0, len(llmState.ProfileIDs)), llmState.ProfileIDs...)
+	mode := t.Mode
+	if mode == "" {
+		mode = db.TaskModePentest
+	}
+	var auditConfig json.RawMessage
+	if mode == db.TaskModeCodeAudit && len(t.AuditConfig) > 0 {
+		auditConfig = append(json.RawMessage(nil), t.AuditConfig...)
+	}
 	return TaskDTO{
 		ID:                 t.ID,
 		ExplorationID:      t.ExpID,
@@ -134,6 +145,8 @@ func taskDTO(t *Task, status string) TaskDTO {
 		SourceTaskIDs:      sourceIDs,
 		CompanyIDs:         lifecycle.CompanyIDs,
 		CoverageEnabled:    t.CoverageEnabled,
+		TaskMode:           mode,
+		AuditConfig:        auditConfig,
 	}
 }
 
@@ -319,6 +332,18 @@ type FindingDTO struct {
 	Evidence  string `json:"evidence"`
 	Report    string `json:"report,omitempty"` // 详细报告(Markdown);仅详情接口返回,列表为空
 
+	// Code-audit evidence. The compact identity fields and engine hits are safe
+	// for list responses; the full code_evidence blob is detail-only so lists
+	// stay small.
+	CWEID        string             `json:"cwe_id,omitempty"`
+	CodePath     string             `json:"code_path,omitempty"`
+	CodeLine     int                `json:"code_line,omitempty"`
+	CodeSymbol   string             `json:"code_symbol,omitempty"`
+	Confidence   float64            `json:"confidence,omitempty"`
+	Verification string             `json:"verification,omitempty"`
+	Engines      []FindingEngineDTO `json:"engines,omitempty"`
+	CodeEvidence json.RawMessage    `json:"code_evidence,omitempty"` // detail endpoint only
+
 	IntentID        string            `json:"intent_id,omitempty"`
 	ParamID         string            `json:"param_id,omitempty"`
 	TaskID          string            `json:"task_id,omitempty"`
@@ -327,6 +352,38 @@ type FindingDTO struct {
 	Inherited       bool              `json:"inherited,omitempty"`
 	Assets          []FindingAssetDTO `json:"assets,omitempty"`
 	TS              string            `json:"ts"`
+}
+
+// FindingEngineDTO is one external-engine corroboration hit. It is surfaced at
+// the top level of a finding so list clients get engine provenance without
+// parsing (or receiving) the full code_evidence payload.
+type FindingEngineDTO struct {
+	Name       string  `json:"name"`
+	QueryID    string  `json:"query_id,omitempty"`
+	Confidence float64 `json:"confidence,omitempty"`
+	RawRef     string  `json:"raw_ref,omitempty"`
+}
+
+// findingEngines extracts engine hits from a raw code_evidence payload. Invalid
+// or absent evidence yields no engines rather than failing serialization.
+func findingEngines(raw json.RawMessage) []FindingEngineDTO {
+	if len(raw) == 0 {
+		return nil
+	}
+	var ev audit.CodeEvidence
+	if err := json.Unmarshal(raw, &ev); err != nil || len(ev.Engines) == 0 {
+		return nil
+	}
+	out := make([]FindingEngineDTO, 0, len(ev.Engines))
+	for _, engine := range ev.Engines {
+		out = append(out, FindingEngineDTO{
+			Name:       engine.Name,
+			QueryID:    engine.QueryID,
+			Confidence: engine.Confidence,
+			RawRef:     engine.RawRef,
+		})
+	}
+	return out
 }
 
 // FindingAssetDTO is one asset a finding is anchored to, pre-labelled for display.
@@ -368,27 +425,60 @@ func assetLabel(a *db.Asset) string {
 }
 
 // findingPayload mirrors the JSON written by the worker's report_finding tool
-// (agent/tools.go addFinding): {vulnclass, severity, summary, evidence:{by,poc}}.
+// (agent/tools.go addFinding) plus the code-audit fields written by
+// RecordFindingTx: {vulnclass, severity, summary, evidence:{by,poc}, ...}.
 type findingPayload struct {
-	VulnClass string          `json:"vulnclass"`
-	Name      string          `json:"name"`
-	Severity  string          `json:"severity"`
-	Summary   string          `json:"summary"`
-	Evidence  json.RawMessage `json:"evidence"`
+	VulnClass    string          `json:"vulnclass"`
+	Name         string          `json:"name"`
+	Severity     string          `json:"severity"`
+	Summary      string          `json:"summary"`
+	Evidence     json.RawMessage `json:"evidence"`
+	CWEID        string          `json:"cwe_id"`
+	CodePath     string          `json:"code_path"`
+	CodeLine     int             `json:"code_line"`
+	CodeSymbol   string          `json:"code_symbol"`
+	Confidence   float64         `json:"confidence"`
+	Verification string          `json:"verification"`
+	CodeEvidence json.RawMessage `json:"code_evidence"`
 }
 
+// findingDTO converts a finding node for list responses: code evidence is
+// reduced to its engine hits and the full blob is omitted.
 func findingDTO(n *db.Node) FindingDTO {
+	return findingDTOWithEvidence(n, false)
+}
+
+// findingDTODetail is the detail conversion that also carries code_evidence.
+func findingDTODetail(n *db.Node) FindingDTO {
+	return findingDTOWithEvidence(n, true)
+}
+
+func findingDTOWithEvidence(n *db.Node, includeCodeEvidence bool) FindingDTO {
 	var p findingPayload
 	_ = json.Unmarshal(n.Payload, &p)
+	verification := p.Verification
+	if verification == "" {
+		verification = "unverified"
+	}
 	d := FindingDTO{
-		ID:        i64s(n.ID),
-		VulnClass: p.VulnClass,
-		Name:      p.Name,
-		Severity:  p.Severity,
-		Status:    db.FindingPending,
-		Summary:   p.Summary,
-		Evidence:  rawString(p.Evidence),
-		TS:        rfc3339(n.CreatedAt),
+		ID:           i64s(n.ID),
+		VulnClass:    p.VulnClass,
+		Name:         p.Name,
+		Severity:     p.Severity,
+		Status:       db.FindingPending,
+		Summary:      p.Summary,
+		Evidence:     rawString(p.Evidence),
+		CWEID:        p.CWEID,
+		CodePath:     p.CodePath,
+		CodeLine:     p.CodeLine,
+		CodeSymbol:   p.CodeSymbol,
+		Confidence:   p.Confidence,
+		Verification: verification,
+		Engines:      findingEngines(p.CodeEvidence),
+		TS:           rfc3339(n.CreatedAt),
+	}
+	if includeCodeEvidence {
+		d.CodeEvidence = p.CodeEvidence
 	}
 	if n.SourceTaskID > 0 {
 		d.SourceTaskID = i64s(n.SourceTaskID)
@@ -436,26 +526,50 @@ func findingAssetDTOs(ids []int64, assets map[int64]*db.Asset) []FindingAssetDTO
 	return out
 }
 
-// findingFromDB converts a standalone DBFinding row to a FindingDTO. task_id and
-// task_description are empty when the originating task has been deleted (NULL).
+// findingFromDB converts a standalone DBFinding row to a list-response DTO:
+// engine hits are kept and the full code_evidence blob is omitted.
+// task_id/task_description are empty when the originating task was deleted.
 func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
+	return findingFromDBWithEvidence(f, assets, false)
+}
+
+// findingFromDBDetail is the getFinding conversion: it includes code_evidence.
+func findingFromDBDetail(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
+	return findingFromDBWithEvidence(f, assets, true)
+}
+
+func findingFromDBWithEvidence(f *db.DBFinding, assets map[int64]*db.Asset, includeCodeEvidence bool) FindingDTO {
 	status := f.Status
 	if status == "" {
 		status = db.FindingPending
+	}
+	verification := f.Verification
+	if verification == "" {
+		verification = "unverified"
 	}
 	d := FindingDTO{
 		ID:           i64s(f.ID),
 		FindingID:    i64s(f.ID),
 		TrafficCount: f.TrafficCount, EvidenceVersion: f.EvidenceVersion, ReportEvidenceVersion: f.ReportEvidenceVersion,
 		ReportStale: f.Report != "" && f.EvidenceVersion != f.ReportEvidenceVersion, TrafficBindings: f.TrafficBindings,
-		VulnClass: f.VulnClass,
-		Name:      f.Name,
-		Severity:  f.Severity,
-		Status:    status,
-		Summary:   f.Summary,
-		Evidence:  f.Evidence,
-		Report:    f.Report,
-		TS:        rfc3339(f.CreatedAt),
+		VulnClass:    f.VulnClass,
+		Name:         f.Name,
+		Severity:     f.Severity,
+		Status:       status,
+		Summary:      f.Summary,
+		Evidence:     f.Evidence,
+		Report:       f.Report,
+		CWEID:        f.CWEID,
+		CodePath:     f.CodePath,
+		CodeLine:     f.CodeLine,
+		CodeSymbol:   f.CodeSymbol,
+		Confidence:   f.Confidence,
+		Verification: verification,
+		Engines:      findingEngines(f.CodeEvidence),
+		TS:           rfc3339(f.CreatedAt),
+	}
+	if includeCodeEvidence {
+		d.CodeEvidence = f.CodeEvidence
 	}
 	d.Assets = findingAssetDTOs(f.AssetIDs, assets)
 	if f.TaskID != nil {

@@ -4,6 +4,58 @@
 export type TaskStatus = "created" | "queued" | "running" | "paused" | "done" | "failed" | "timeout";
 export type EngineMode = "exploring" | "paused" | "stalled" | "idle";
 
+// ---- Code audit ----
+export type TaskMode = "pentest" | "code_audit";
+export type AuditSourceType = "git" | "local" | "zip";
+export type AuditDepth = "quick" | "standard" | "deep";
+export type AuditCWEScope = "core" | "full" | "explicit";
+export type AuditEngineChoice = "required" | "auto" | "off";
+
+// 创建代码审计任务时冻结在 tasks.audit_config 的配置。
+export interface AuditConfig {
+  source_type: AuditSourceType;
+  repo_url?: string;
+  ref?: string;
+  local_path?: string;
+  upload_id?: string;
+  depth: AuditDepth;
+  cwe_scope: AuditCWEScope;
+  cwe_ids?: string[];
+  languages?: string[];
+  max_rounds?: number;
+  engines?: {
+    codegraph?: AuditEngineChoice;
+    codeql?: Exclude<AuditEngineChoice, "required">;
+    joern?: Exclude<AuditEngineChoice, "required">;
+  };
+  budgets?: Record<string, number>;
+  include_tests?: boolean;
+  include_vendor?: boolean;
+  // 旧模板/扩展字段可能带更多键，保持后向兼容。
+  [key: string]: unknown;
+}
+
+export interface AuditEngineCapability {
+  available?: boolean;
+  path?: string;
+  version?: string;
+}
+
+export interface AuditCapabilities {
+  codegraph?: AuditEngineCapability;
+  codeql?: AuditEngineCapability;
+  joern?: AuditEngineCapability;
+  local_roots?: { count?: number; basenames?: string[] };
+  limits?: {
+    max_source_bytes?: number;
+    max_files?: number;
+    max_file_bytes?: number;
+    max_sink_sites_per_cwe?: number;
+    max_rounds?: number;
+    depths?: string[];
+  };
+}
+
 export interface Task {
   id: string;
   name?: string; // 可选任务名称;空/缺省=未命名,展示时回退到描述
@@ -14,6 +66,8 @@ export interface Task {
   description: string;
   goal: string;
   status: TaskStatus;
+  task_mode?: TaskMode; // 空/缺省=pentest（老任务）
+  audit_config?: AuditConfig; // 仅 code_audit；创建时冻结的配置
   created_at: string;
   created_unix?: number; // created_at as unix seconds (run-duration calc)
   completed_at?: string; // RFC3339 finish time (done/failed); "" if unfinished
@@ -56,6 +110,8 @@ export interface TaskTemplate {
   goal: string;
   category_id?: number | null; // 预设分类；null/缺省=无
   intercept_rules?: AssetInterceptRuleInput[]; // 预设的任务级拦截/允许规则
+  task_mode?: TaskMode; // 空/缺省=pentest
+  audit_config?: AuditConfig; // 仅 code_audit 模板
   created_at: string;
   updated_at: string;
 }
@@ -466,8 +522,276 @@ export interface TaskConstraint {
   ts?: string;
 }
 
+// ---- Code audit progress ----
+// 与后端 audit_progress 投影保持宽容兼容：实际响应里的 engines 是作业数组，
+// gates 是以 phase/coverage/cwe 为键的对象；旧版设计稿里也有对象形态（见联合类型）。
+export interface AuditEngineState {
+  available?: boolean;
+  state?: string;
+  version?: string;
+  reason?: string;
+  path?: string;
+}
+
+export interface AuditPhase {
+  id?: number;
+  session_id?: number;
+  round?: number;
+  phase: string;
+  status: string;
+  required?: boolean;
+  reason?: string;
+  gate?: AuditGate | string | null;
+  stats?: Record<string, unknown> | null;
+  started_at?: string;
+  completed_at?: string;
+}
+
+export interface AuditCoverage {
+  cwe?: number;
+  sink_sites?: number;
+  modules?: number;
+  entry_points?: number;
+  planned_cwe?: number;
+  covered_cwe?: number;
+  planned_sites?: number;
+  covered_sites?: number;
+  planned_modules?: number;
+  covered_modules?: number;
+  planned_entries?: number;
+  covered_entries?: number;
+  invalid_exemptions?: number;
+}
+
+export interface AuditGate {
+  name?: string;
+  passed?: boolean;
+  reason?: string;
+  details?: Record<string, unknown>;
+}
+
+export interface AuditCandidate {
+  id?: string | number;
+  phase?: string;
+  cwe?: string;
+  language?: string;
+  module?: string;
+  sink_keys?: string[];
+  finding_ids?: number[];
+  priority?: number;
+  severity?: string;
+  scope?: Record<string, unknown>;
+}
+
+export interface AuditEngineJob {
+  id?: number;
+  intent_id?: number;
+  engine: string;
+  job_kind?: string;
+  query_hash?: string;
+  status?: string;
+  query_text?: string;
+  query_path?: string;
+  artifact_path?: string;
+  result_count?: number;
+  duration_ms?: number;
+  error?: string;
+}
+
+export interface AuditHypothesis {
+  id?: number;
+  session_id?: number;
+  round?: number;
+  hypothesis_key?: string;
+  statement?: string;
+  status?: string;
+  attempts?: unknown;
+  evidence?: string;
+  priority?: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface AuditRound {
+  id?: number;
+  session_id?: number;
+  round: number;
+  new_findings?: number;
+  new_confirmed?: number;
+  new_candidate?: number;
+  total_findings?: number;
+  gate_c?: string;
+  gate_cwe?: string;
+  gate_h?: string;
+  gate_e?: string;
+  gate_coverage?: string;
+  gate_engine?: string;
+  decision?: string;
+  focus?: unknown;
+  token_usage?: unknown;
+  created_at?: string;
+}
+
+export interface AuditSessionSummary {
+  id?: number;
+  task_id?: number;
+  status?: string;
+  round?: number;
+  max_rounds?: number;
+  depth?: string;
+  backend?: string;
+  languages?: string[];
+  source_type?: string;
+  source_ref?: string;
+  source_label?: string;
+  commit_sha?: string;
+  repo_asset_id?: number;
+  started_at?: string;
+  completed_at?: string;
+}
+
+export interface AuditProgress {
+  session?: AuditSessionSummary;
+  phases?: AuditPhase[];
+  coverage?: AuditCoverage;
+  gates?: Record<string, AuditGate | string> | AuditGate[];
+  engines?: AuditEngineJob[] | Record<string, AuditEngineState | string>;
+  candidates?: AuditCandidate[];
+  findings?: {
+    total?: number;
+    by_verification?: Record<string, number>;
+    candidate?: number;
+    confirmed?: number;
+    refuted?: number;
+    design_intent?: number;
+  };
+  hypotheses?: AuditHypothesis[] | Record<string, number>;
+  budget?: {
+    round?: number;
+    max_rounds?: number;
+    depth?: string;
+    engines?: Record<string, string>;
+    intents_used?: number;
+    intents_max?: number;
+    tokens_used?: number;
+    [key: string]: unknown;
+  };
+  intents?: { counts?: Record<string, number>; detection?: unknown[] };
+  rounds?: AuditRound[];
+  ready_to_complete?: boolean;
+  ready_reason?: string;
+  report_ready?: boolean;
+  report_url?: string;
+  source_label?: string;
+  source?: Record<string, unknown>;
+  coverage_detail?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface AuditSourceFile {
+  path: string;
+  start_line: number;
+  end_line: number;
+  total_lines: number;
+  content: string;
+  language: string;
+}
+
 // ---- Findings ----
 export type Severity = "critical" | "high" | "medium" | "low";
+
+export interface FindingEngine {
+  name: string;
+  query_id?: string;
+  confidence?: number;
+  raw_ref?: string;
+}
+
+export interface CodeLocation {
+  path?: string;
+  line?: number;
+  end_line?: number;
+  symbol?: string;
+  snippet?: string;
+  api?: string;
+}
+
+export interface CodeTraceStep {
+  path: string;
+  line: number;
+  symbol: string;
+  note?: string;
+}
+
+export interface SanitizerVerdict {
+  symbol: string;
+  verdict: string;
+  note?: string;
+}
+
+export interface SemanticStep {
+  stage: string;
+  operation: string;
+  input?: string;
+  output?: string;
+  semantics_from?: string;
+  semantics_to?: string;
+  consumer_assumption?: string;
+}
+
+export interface CodeReachability {
+  reachable?: boolean;
+  entry_point?: string;
+  auth_required?: boolean;
+  auth_state_recorded?: boolean;
+  path?: string;
+}
+
+export interface CodePOCEvidence {
+  kind?: string;
+  artifact_path?: string;
+  description?: string;
+  executed?: boolean;
+}
+
+export interface CodeEvidenceVerification {
+  status?: string;
+  method?: string;
+  reason?: string;
+  alternative_path?: string;
+  verified_by_intent?: number;
+  design_validation?: string;
+}
+
+export interface CodeEvidenceAnalysis {
+  phase?: string;
+  round?: number;
+  intent_id?: number;
+  backend?: string;
+  fallback?: boolean;
+}
+
+export interface CodeEvidence {
+  version?: number;
+  cwe_id?: string;
+  title?: string;
+  severity?: Severity | string;
+  confidence?: number;
+  verification?: CodeEvidenceVerification;
+  location?: CodeLocation;
+  source?: CodeLocation | null;
+  sink?: CodeLocation | null;
+  trace?: CodeTraceStep[];
+  sanitizers?: SanitizerVerdict[];
+  semantic_chain?: SemanticStep[];
+  reachability?: CodeReachability | null;
+  preconditions?: string[];
+  impact?: string;
+  poc?: CodePOCEvidence | null;
+  engines?: FindingEngine[];
+  analysis?: CodeEvidenceAnalysis;
+  dedupe_key?: string;
+}
 
 // 漏洞处置状态:待处理 / 处理中 / 已确认 / 已处理 / 已修复 / 误报 / 忽略 / 重复 / 风险接受。
 export type FindingStatus =
@@ -502,6 +826,18 @@ export interface Finding {
   summary: string;
   evidence: string;
   report?: string; // 详细报告(Markdown);仅详情接口返回,列表为空
+  // 代码审计紧凑字段（列表接口也会返回）。
+  cwe_id?: string;
+  code_path?: string;
+  code_line?: number;
+  code_symbol?: string;
+  confidence?: number;
+  verification?: string;
+  engines?: FindingEngine[];
+  audit_round?: number;
+  audit_phase?: string;
+  // 完整结构化代码证据（仅详情接口返回）。
+  code_evidence?: CodeEvidence | null;
   intent_id?: string;
   param_id?: string;
   task_id?: string;

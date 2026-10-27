@@ -1,2 +1,4 @@
 *.bat text eol=crlf
 *.sh  text eol=lf
+*.go  text eol=lf
+audit/data/audit-registry.json text eol=lf

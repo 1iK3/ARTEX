@@ -40,6 +40,16 @@ type Planner struct {
 	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
 	compactor         *Compactor                             // cold-node compaction (§7); nil = disabled
 
+	// --- code-audit mode ---
+	// auditMode switches the planner to the curated audit surface (no SDK default
+	// tools, no WebFetch/WebSearch, no code tools) and the audit prompt/protocol.
+	auditMode bool
+	// agentKey is the agent identity used for prompt overrides, skill/MCP
+	// visibility and the DB tools table. Default "planner".
+	agentKey string
+	// auditDeps supplies audit_progress. nil = the tool reports unavailable.
+	auditDeps AuditDeps
+
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
 	// session, but the shared store lets it record a serial exploit chain once and
@@ -99,6 +109,37 @@ func (p *Planner) SetWebSearch(o WebSearchOpts) { p.webSearch = o }
 // constraints get injected into the planner system prompt. Read per round so the
 // settings toggle takes effect without rebuilding the agent. nil = inject (default).
 func (p *Planner) SetConstraintInject(fn func() bool) { p.injectConstraints = fn }
+
+// SetAuditMode switches this planner to the curated code-audit planning surface.
+func (p *Planner) SetAuditMode(enabled bool) { p.auditMode = enabled }
+
+// SetAgentKey sets the agent identity (default "planner") used for prompt
+// overrides, skill/MCP visibility and the DB tools table.
+func (p *Planner) SetAgentKey(key string) { p.agentKey = strings.TrimSpace(key) }
+
+// SetAuditDeps wires the audit progress facade consumed by audit_progress.
+func (p *Planner) SetAuditDeps(deps AuditDeps) { p.auditDeps = deps }
+
+func (p *Planner) resolvedAgentKey() string {
+	if p.agentKey != "" {
+		return p.agentKey
+	}
+	// Audit mode forces the code-audit planner identity so a missing SetAgentKey
+	// cannot fall back to the pentest planner prompt/identity.
+	if p.auditMode {
+		return "code_planner"
+	}
+	return "planner"
+}
+
+// plannerBaseTools is the pure base-tool selection used by Plan. Audit mode gets
+// only AuditPlannerTools: no SDK defaults and no code/codegraph tools.
+func (p *Planner) plannerBaseTools(tsx *ToolSet) []actool.CoreTool {
+	if p.auditMode {
+		return tsx.AuditPlannerTools()
+	}
+	return append(tsx.DropCoverageTools(tsx.PlannerTools()), actool.DefaultTools()...)
+}
 
 // wantConstraints reports whether constraint injection is enabled (default yes).
 func (p *Planner) wantConstraints() bool { return p.injectConstraints == nil || p.injectConstraints() }
@@ -340,7 +381,13 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 不重复、不硬凑；但目标未达成、又有未覆盖且更深的打法时，该派就派。简洁、聚焦、高效。`
 
 func plannerSystem(goal, dataDir, workDir string) string {
-	body := renderSystem("planner", plannerDefaultTmpl, PlannerVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
+	return plannerSystemFor("planner", goal, dataDir, workDir)
+}
+
+// plannerSystemFor is plannerSystem with an explicit agent key so a code-audit
+// planner renders its own prompt override while keeping the code-owned tail.
+func plannerSystemFor(agentKey, goal, dataDir, workDir string) string {
+	body := renderSystem(agentKey, plannerDefaultTmpl, PlannerVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
 	return body + artifactSpec(workDir)
 }
 
@@ -370,11 +417,17 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	if origin, _ := ts.OriginFactID(); origin > 0 {
 		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)
 	}
+	tsx.SetAuditMode(p.auditMode)
+	tsx.SetAuditDeps(p.auditDeps)
+	agentKey := p.resolvedAgentKey()
 	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
-	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), actool.DefaultTools()...)
+	// Audit mode gets only AuditPlannerTools (no SDK defaults, no code tools).
+	base := p.plannerBaseTools(tsx)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
-	tools, def, cleanup := AugmentTools(ctx, "planner", base)
+	// Audit mode bypasses AugmentTools entirely (see assembleAgentTools): MCP,
+	// skills, interactive_shell, host tools and DB bindings cannot add tools.
+	tools, def, cleanup := assembleAgentTools(ctx, p.auditMode, agentKey, base)
 	defer cleanup()
 	// 关键态势（刚完成的意图 + 预取的完整图）改放【本轮 user 输入】(见下方 input)，system
 	// 只留静态规划正文。move-out 让 system 每轮稳定、更利于缓存；代价是若单轮变长，态势可能
@@ -390,7 +443,14 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 本任务的工作目录 <workDir>/tasks/<taskID>，先建好。
 	taskDir := ensureRunDir(p.workDir, taskID, 0)
 	ctx = intercept.WithReviewContext(ctx, taskDir, intercept.ReviewBackground{})
-	sysBody := plannerSystem(goal, p.workDir, taskDir)
+	sysBody := ""
+	if p.auditMode {
+		// Code-owned audit planner protocol; no pentest artifact tail and no code
+		// tools (the planner only dispatches intents and judges gates).
+		sysBody = auditPlannerSystem(agentKey, goal, p.workDir)
+	} else {
+		sysBody = plannerSystemFor(agentKey, goal, p.workDir, taskDir)
+	}
 	if p.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,框定探索边界
 	}
@@ -398,9 +458,25 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// planner 无自身墙钟预算;有 deadline 时把 MaxDuration 夹逼到剩余,让在跑的规划轮在
 	// 任务到点时进收尾(因超时→任务超时词,因步数→per-run 词)。
 	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, 0)
-	settle := wrapupSettlement("planner", nil)
+	// Audit runs resolve their own wrap-up key so a pentest planner-specific
+	// prompt cannot leak into an audit round (and future code_planner overrides
+	// take effect).
+	settleKey := "planner"
+	if p.auditMode {
+		settleKey = agentKey
+	}
+	settle := wrapupSettlement(settleKey, nil)
 	if tc.DeadlineUnix > 0 {
-		settle = wrapupSettlementForTask("planner", nil, clamped)
+		settle = wrapupSettlementForTask(settleKey, nil, clamped)
+	}
+	// Audit planners are offline: WebFetch/WebSearch/Bash are off in addition to
+	// being absent from the curated tool list. The tool list is the security
+	// boundary; ModeBypass is therefore safe for audit runs.
+	enableWebFetch := true
+	enableWebSearch := p.webSearch.Enabled
+	bashEnv := proxyEnv(p.proxyAddr, p.proxyCACert)
+	if p.auditMode {
+		enableWebFetch, enableWebSearch, bashEnv = false, false, nil
 	}
 	opts := agentcore.Options{
 		Provider:        p.prov,
@@ -410,12 +486,12 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
 		PermissionMode:  permission.ModeBypass,
-		EnableWebFetch:  true, // 走记录代理留痕；载入代理 CA 验证 MITM 重签的 HTTPS 证书
+		EnableWebFetch:  enableWebFetch, // 走记录代理留痕；载入代理 CA 验证 MITM 重签的 HTTPS 证书
 		WebFetchProxy:   p.proxyAddr,
 		WebFetchCACert:  p.proxyCACert,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
 		// WebSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
-		EnableWebSearch:       p.webSearch.Enabled,
+		EnableWebSearch:       enableWebSearch,
 		WebSearchBackend:      p.webSearch.Backend,
 		BraveSearchAPIKey:     p.webSearch.BraveKey,
 		TavilySearchAPIKey:    p.webSearch.TavilyKey,
@@ -423,8 +499,8 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		DeepSeekSearchAPIKey:  p.webSearch.DeepSeekAPIKey,
 		DeepSeekSearchModel:   p.webSearch.DeepSeekModel,
 		WebSearchProxy:        p.webSearch.Proxy,
-		BashEnv:               proxyEnv(p.proxyAddr, p.proxyCACert), // Bash 子命令默认走代理+信任 CA
-		WorkingDir:            taskDir,                              // 本任务工作目录 <workDir>/tasks/<taskID>
+		BashEnv:               bashEnv, // Bash 子命令默认走代理+信任 CA
+		WorkingDir:            taskDir, // 本任务工作目录 <workDir>/tasks/<taskID>
 		ToolOutputDir:         cmdOutDir(taskDir),
 		MaxTurns:              p.maxTurns, // 0 = unlimited (configurable in agent management)
 		MaxDuration:           maxDur,     // 0=不限;有 deadline 时=距 deadline 剩余
@@ -437,6 +513,12 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		Settlement:   settle,
 		NonStreaming: p.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    p.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+	}
+	if p.auditMode {
+		// The SDK otherwise auto-injects TaskOutput/TaskStop/TaskList/Monitor;
+		// Monitor can spawn an arbitrary shell command. DisallowedTools is the
+		// permission-layer backup in addition to the curated Tools list.
+		opts.DisableBackgroundTasks, opts.DisallowedTools = auditSessionSafetyOptions()
 	}
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx

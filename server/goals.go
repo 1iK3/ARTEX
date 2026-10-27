@@ -29,9 +29,13 @@ func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 	if !s.engine.beginTaskOperation(t.ID) {
 		return
 	}
-	s.seed(t, seedText)
-	if seedFirstIntent {
-		s.seedFirstIntent(t)
+	// code_audit does not use the pentest target seed or the pentest goal
+	// decomposition: the audit director owns source ingestion and goals.
+	if t.Mode != db.TaskModeCodeAudit {
+		s.seed(t, seedText)
+		if seedFirstIntent {
+			s.seedFirstIntent(t)
+		}
 	}
 	s.engine.decInflight(t.ID)
 	if _, err := s.admitTask(t, "bootstrap"); err != nil {
@@ -42,6 +46,12 @@ func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 func (s *Server) startTaskEngine(t *Task) {
 	ctx := s.engine.execContextFor(s.ctx, t.ID)
 	if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
+		return
+	}
+	if t.Mode == db.TaskModeCodeAudit {
+		// The audit director owns ingest/profile/plan/index and then starts the
+		// shared engine. Never enter the pentest goal-decomposition path here.
+		s.startCodeAudit(t)
 		return
 	}
 	s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
@@ -240,6 +250,16 @@ func (s *Server) startAdmittedTask(t *Task, mode string) {
 			defer s.engine.decInflight(t.ID)
 			s.startTaskEngine(t)
 		}()
+		return
+	}
+	if t.Mode == db.TaskModeCodeAudit {
+		// Resume/revive goes through the audit director rather than the pentest
+		// Run/Resume path. Clearing the Engine pause barrier is admission's job and
+		// this function runs under concMu. Detach the (possibly slow) preflight.
+		if s.engine.IsPaused(t.ID) {
+			s.engine.Resume(t)
+		}
+		go s.startCodeAudit(t)
 		return
 	}
 	s.engine.Run(s.ctx, t)

@@ -466,3 +466,177 @@ func assertArchiveGlobalStats(t *testing.T, d *DB, profileName, skillName, toolN
 		t.Fatalf("archive finding class %q missing", vulnclass)
 	}
 }
+
+var archivedFindingAuditColumns = []string{
+	"cwe_id", "code_path", "code_line", "code_symbol", "confidence",
+	"verification", "dedupe_key", "code_evidence", "audit_round", "audit_phase",
+}
+
+// TestArchivedFindingNormalizerBackfillsAuditDefaults simulates a findings
+// payload written before the Code Audit columns existed. json_populate_recordset
+// would turn the missing keys into NULL and violate the new NOT NULL columns, so
+// the restore normalizer must inject their SQL defaults.
+func TestArchivedFindingNormalizerBackfillsAuditDefaults(t *testing.T) {
+	raw := json.RawMessage(`[{
+		"id": 1, "task_id": 2, "vulnclass": "legacy", "name": "old finding",
+		"severity": "high", "summary": "s", "evidence": "e", "worker": "w",
+		"asset_ids": [], "status": "pending", "report": "",
+		"created_at": "2026-01-01T00:00:00Z", "code_evidence": null
+	}]`)
+	normalized, err := normalizeArchivedFindingVersions(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := decodeArchiveRows(normalized)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("normalized rows=%d err=%v", len(rows), err)
+	}
+	row := rows[0]
+	for _, key := range []string{"cwe_id", "code_path", "code_symbol", "dedupe_key", "audit_phase"} {
+		if value, ok := row[key].(string); !ok || value != "" {
+			t.Fatalf("%s=%v, want empty string", key, row[key])
+		}
+	}
+	for _, key := range []string{"code_line", "confidence", "audit_round"} {
+		value, ok := jsonInt64(row[key])
+		if !ok || value != 0 {
+			t.Fatalf("%s=%v, want 0", key, row[key])
+		}
+	}
+	if row["verification"] != "unverified" {
+		t.Fatalf("verification=%v, want unverified", row["verification"])
+	}
+	evidence, ok := row["code_evidence"].(map[string]any)
+	if !ok || len(evidence) != 0 {
+		t.Fatalf("code_evidence=%v, want {}", row["code_evidence"])
+	}
+	if row["name"] != "old finding" {
+		t.Fatalf("normalizer dropped existing fields: %+v", row)
+	}
+}
+
+func TestTaskArchiveRejectsCodeAudit(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+	task, err := d.CreateTaskWithOptions("audit archive guard", "must not archive", TaskCreateOptions{
+		Mode:        TaskModeCodeAudit,
+		AuditConfig: json.RawMessage(`{"depth":"deep"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID)
+		_ = d.DeleteTask(task.ID)
+	}()
+	if err := d.SetPaused(task.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.QueueTaskArchive(task.ID); !errors.Is(err, ErrTaskArchiveUnsupported) {
+		t.Fatalf("QueueTaskArchive code_audit error=%v, want ErrTaskArchiveUnsupported", err)
+	}
+	if _, err := d.SnapshotTaskArchive(task.ID); !errors.Is(err, ErrTaskArchiveUnsupported) {
+		t.Fatalf("SnapshotTaskArchive code_audit error=%v, want ErrTaskArchiveUnsupported", err)
+	}
+	var archives int
+	if err := d.QueryRow(`SELECT count(*) FROM task_archives WHERE task_id=$1`, task.ID).Scan(&archives); err != nil {
+		t.Fatal(err)
+	}
+	if archives != 0 {
+		t.Fatalf("rejected code_audit task created %d archive rows", archives)
+	}
+}
+
+func TestArchivedFindingRestoreBackfillsAuditDefaults(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+	if err := d.EnsureLLMRecordsTable(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.EnsureLLMUsageTable(); err != nil {
+		t.Fatal(err)
+	}
+	task, err := d.CreateTaskWithOptions("archive finding defaults", "restore old findings", TaskCreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = d.Exec(`DELETE FROM findings WHERE task_id=$1`, task.ID)
+		_, _ = d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID)
+		_ = d.DeleteTask(task.ID)
+	}()
+	if err := d.SetPaused(task.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.AddFinding(task.ID, 0, "archive-defaults", "legacy finding", SeverityHigh, "summary", "evidence", "worker", nil); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := d.QueueTaskArchive(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := d.ClaimTaskArchiveJob(t.Context())
+	if err != nil || claimed == nil || claimed.ID != queued.ID || claimed.State != Archiving {
+		t.Fatalf("archive claim=%+v err=%v", claimed, err)
+	}
+	snapshot, err := d.SnapshotTaskArchive(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := decodeArchiveRows(snapshot.Tables["findings"])
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("snapshot findings rows=%d err=%v", len(rows), err)
+	}
+	for _, key := range archivedFindingAuditColumns {
+		delete(rows[0], key)
+	}
+	var stripped []map[string]json.RawMessage
+	if snapshot.Tables["findings"], err = json.Marshal(rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(snapshot.Tables["findings"], &stripped); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range archivedFindingAuditColumns {
+		if _, exists := stripped[0][key]; exists {
+			t.Fatalf("test archive still contains audit column %q", key)
+		}
+	}
+	if err := d.CompleteTaskArchive(queued.ID, snapshot, "/tmp/finding-defaults.tar.zst", "sha", 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.QueueTaskArchiveRestore(queued.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = d.ClaimTaskArchiveJob(t.Context())
+	if err != nil || claimed == nil || claimed.ID != queued.ID || claimed.State != Restoring {
+		t.Fatalf("restore claim=%+v err=%v", claimed, err)
+	}
+	if _, err := d.RestoreTaskArchive(queued.ID, snapshot, 0); err != nil {
+		t.Fatalf("restore archive with legacy findings payload: %v", err)
+	}
+
+	var cweID, codePath, codeSymbol, verification, dedupeKey, codeEvidence, auditPhase string
+	var codeLine, auditRound int
+	var confidence float64
+	if err := d.QueryRow(`SELECT cwe_id,code_path,code_line,code_symbol,confidence,
+ verification,dedupe_key,code_evidence::text,audit_round,audit_phase
+FROM findings WHERE task_id=$1`, task.ID).Scan(
+		&cweID, &codePath, &codeLine, &codeSymbol, &confidence, &verification,
+		&dedupeKey, &codeEvidence, &auditRound, &auditPhase,
+	); err != nil {
+		t.Fatalf("restored finding: %v", err)
+	}
+	if cweID != "" || codePath != "" || codeLine != 0 || codeSymbol != "" || confidence != 0 ||
+		verification != "unverified" || dedupeKey != "" || codeEvidence != "{}" ||
+		auditRound != 0 || auditPhase != "" {
+		t.Fatalf("legacy finding defaults not restored: cwe=%q path=%q line=%d symbol=%q confidence=%v verification=%q dedupe=%q evidence=%s round=%d phase=%q",
+			cweID, codePath, codeLine, codeSymbol, confidence, verification, dedupeKey, codeEvidence, auditRound, auditPhase)
+	}
+}

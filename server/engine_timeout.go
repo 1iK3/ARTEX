@@ -129,7 +129,9 @@ func (e *Engine) clockCtx(base context.Context, t *Task, final bool) context.Con
 // Called from Run() and from the restart reload path, so non-active timeout tasks
 // still get settled after their deadline even without live planner/worker loops.
 func (e *Engine) startDeadlineCoordinator(ctx context.Context, t *Task) {
-	if t == nil || t.TimeoutSeconds <= 0 {
+	// code_audit tasks must not enter the pentest timeout settle/final-planner
+	// path. The audit director will own audit deadlines when wired.
+	if t == nil || t.Mode == db.TaskModeCodeAudit || t.TimeoutSeconds <= 0 {
 		return
 	}
 	e.deleteMu.RLock()
@@ -182,6 +184,11 @@ func (e *Engine) deadlineCoordinator(ctx context.Context, t *Task) {
 
 // settleTask runs the ordered settle sequence once (§4 steps ①–⑥).
 func (e *Engine) settleTask(ctx context.Context, t *Task) {
+	// Defense in depth for a coordinator that was started before the mode guard
+	// existed: an audit task must never run the final pentest planner round.
+	if t == nil || t.Mode == db.TaskModeCodeAudit {
+		return
+	}
 	if !e.markSettling(t.ID) {
 		return
 	}
