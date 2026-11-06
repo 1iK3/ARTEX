@@ -12,10 +12,73 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/audit"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 )
+
+func TestAuditWorkerConfigFromTask(t *testing.T) {
+	task := &Task{
+		ID:          "42",
+		Mode:        db.TaskModeCodeAudit,
+		AuditConfig: json.RawMessage(`{"worker":{"backend":"codex","mode":"privileged","command":"codex","args":["exec","{{input_file}}"]}}`),
+	}
+	cfg, ok := auditWorkerConfig(task)
+	if !ok {
+		t.Fatalf("auditWorkerConfig() ok = false")
+	}
+	if cfg.Backend != audit.WorkerBackendCodex || cfg.Mode != audit.WorkerModePrivileged || cfg.Command != "codex" {
+		t.Fatalf("cfg = %+v", cfg)
+	}
+	if runtime := workerRuntimeForTask(task); runtime == nil || runtime.Name() != audit.WorkerBackendCodex {
+		t.Fatalf("workerRuntimeForTask() = %#v", runtime)
+	}
+}
+
+func TestAuditWorkerConfigFromPentestTask(t *testing.T) {
+	task := &Task{
+		ID:           "43",
+		Mode:         db.TaskModePentest,
+		WorkerConfig: json.RawMessage(`{"backend":"opencode","mode":"privileged","command":"opencode","args":["run","--auto","{{prompt}}"]}`),
+	}
+	cfg, ok := auditWorkerConfig(task)
+	if !ok {
+		t.Fatalf("auditWorkerConfig() ok = false")
+	}
+	if cfg.Backend != audit.WorkerBackendOpenCode || cfg.Mode != audit.WorkerModePrivileged || cfg.Command != "opencode" {
+		t.Fatalf("cfg = %+v", cfg)
+	}
+	if runtime := workerRuntimeForTask(task); runtime == nil || runtime.Name() != audit.WorkerBackendOpenCode {
+		t.Fatalf("workerRuntimeForTask() = %#v", runtime)
+	}
+}
+
+func TestAgentsForTaskUsesExternalWorkerRuntime(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{
+		m:           m,
+		engine:      NewEngine(m),
+		ctx:         context.Background(),
+		taskAgentMu: sync.Mutex{},
+		taskAgents:  map[string]*taskAgentBundle{},
+	}
+	task := &Task{
+		ID:          "42",
+		Mode:        db.TaskModeCodeAudit,
+		AuditConfig: json.RawMessage(`{"worker":{"backend":"codex","mode":"privileged","command":"codex","args":["exec","{{input_file}}"]}}`),
+	}
+	bundle := s.agentsForTask(task)
+	if got := bundle.wk.ExternalRuntimeName(); got != audit.WorkerBackendCodex {
+		t.Fatalf("worker external runtime = %q, want codex", got)
+	}
+	if !bundle.wk.ExternalRuntimePrivileged() {
+		t.Fatalf("worker external runtime privilege = false, want true")
+	}
+}
 
 type scriptedLLMProvider struct {
 	events []llm.StreamEvent

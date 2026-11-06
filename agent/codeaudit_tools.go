@@ -29,6 +29,9 @@ type AuditDeps interface {
 	// intent's audit round to a newly created planner intent.
 	ClaimAuditCoverage(ctx context.Context, taskID, intentID int64, sinkKeys []string) error
 	WriteAuditArtifact(ctx context.Context, taskID int64, relPath string, content []byte) (string, error)
+	// AttachAuditPOC binds a stored non-executing PoC artifact to a finding
+	// assigned to the S10 intent. The server enforces intent ownership.
+	AttachAuditPOC(ctx context.Context, taskID, findingID, intentID int64, artifactPath, description string) error
 	AuditProgress(ctx context.Context, taskID int64) (json.RawMessage, error)
 	// CurrentAuditRound returns the session round planner intents must target.
 	CurrentAuditRound(ctx context.Context, taskID int64) (int, error)
@@ -98,10 +101,10 @@ const auditWorkerDefaultTmpl = `你是代码审计系统的"执行者"(audit wor
 
 工作方式：
 - 只做领到的这一条意图；发现意图外的高价值线索，用 record_fact 记一条交规划者，不要自行扩大范围。
-- S4 先调用 audit_assigned_coverage；S5/S8 验证意图通常没有 sink_keys，改调用 audit_assigned_findings 读取 audit.finding_ids 指定的 finding。
+- S3 数据流先调用 audit_assigned_coverage；S4 先调用 audit_assigned_coverage；S5/S8/S10 验证或 PoC 意图通常没有 sink_keys，改调用 audit_assigned_findings 读取 audit.finding_ids 指定的 finding。
 - 先定位 source/sink/module，再用 codegraph_explore/node/callers/callees/impact 建立 source→sink 路径；需要原文时优先用 CodeGraph 返回的源码。
 - 只记录真实看到的内容；证据不足用 audit_hypothesis 记录假设，不要写成已确认漏洞。
-- S4 每个分配到的 sink/模块都必须回执覆盖；S5/S8 用 update_finding_verification 写回确认/反驳/设计意图结论。
+- S3 每个入口点必须给出明确有流/无流结论；S4 每个分配到的 sink/模块都必须回执覆盖；S5 用 update_finding_verification 写回确认/反驳，S6/S7/S9 用 report_code_finding/audit_hypothesis 记录逻辑、合规、深析与放大结论，S8 写回设计验证裁决，S10 用 audit_artifact_write 生成非执行 PoC。
 - 最后用一两句话说明本意图完成了什么、提交了哪些 finding/覆盖回执。`
 
 // AuditWorkerTools is the curated code-audit worker surface. It deliberately
@@ -173,8 +176,9 @@ const auditWorkerDisciplineBlock = "\n\n**代码审计执行纪律（代码层�
 	"- **禁止执行目标代码**：不运行构建/脚本/服务、不安装依赖、不访问网络；你没有 Bash/网络/源码写入工具。\n" +
 	"- **只用 CodeGraph 分析**：优先 codegraph_explore/node/files/callers/callees/impact；仅在 CodeGraph 不可用且工具列表提供时，使用只读的 code_search/code_read 兜底。\n" +
 	"- **引擎结果只是候选**：规则/引擎命中必须独立复核 source→sink→trace→sanitizer 后才能确认，不得直接复制为 confirmed。\n" +
-	"- **先读分配再分析**：S4 调用 audit_assigned_coverage；S5/S8 无 sink_keys 时调用 audit_assigned_findings 读取 audit.finding_ids 指定 finding。覆盖回执只能使用分配给当前 intent 的 sink_key，未知/未分配 key 会被拒绝。\n" +
-	"- **S4 必须提交覆盖回执**：每个分配到的 sink/模块都要在 audit_intent_complete 中给出 scanned/candidate/benign/exempt/missed；exempt 必须写 reason。S5/S8 用 update_finding_verification 结束复核。\n" +
+	"- **先读分配再分析**：S3 调用 audit_assigned_coverage；S4 调用 audit_assigned_coverage；S5/S8/S10 无 sink_keys 时调用 audit_assigned_findings 读取 audit.finding_ids 指定 finding。覆盖回执只能使用分配给当前 intent 的 sink_key，未知/未分配 key 会被拒绝。\n" +
+	"- **阶段方法**：S3 数据流必须记录 source→sink/sanitizer/替代路径；S6 逻辑/合规必须覆盖关键业务流程与授权边界；S7 Odin 深析必须检查反射/变换/TOCTOU/信任链；S8 设计验证必须给出 Q1–Q5 裁决；S9 深度放大必须记录五探针并控制新增；S10 非执行 PoC 必须写入 audit_artifacts 并绑定 finding_id。\n" +
+	"- **S4 必须提交覆盖回执**：每个分配到的 sink/模块都要在 audit_intent_complete 中给出 scanned/candidate/benign/exempt/missed；exempt 必须写 reason。S5/S8 用 update_finding_verification 结束复核；S10 PoC 绑定后 executed=false。\n" +
 	"- **漏洞只用 report_code_finding 上报**并附结构化 code_evidence；假设用 audit_hypothesis，复核结论用 update_finding_verification。\n" +
 	"- **中间产物只写 audit/artifacts**：只能通过 audit_artifact_write 写入相对路径；不要写 /tmp、其它绝对路径或源码树。"
 
@@ -231,8 +235,9 @@ const auditPlannerDefaultTmpl = `你是代码审计系统的"规划者"(audit pl
 const auditPlannerProtocolBlock = "\n\n**代码审计规划协议（代码层强制，不可编辑）**：\n" +
 	"- 每轮先读 `audit_progress`：session(round/depth)、phases、coverage、gates、candidates、engines、findings/hypotheses 与 budget。\n" +
 	"- 只从 candidates 派发审计意图（0–4 条）；S4 候选的 sink_keys 必须原样写入 add_intent 的 audit.sink_keys，并带 phase/round/cwe/language/scope/deliverables；S5/S8 验证候选没有 sink_keys，必须把 candidates[].finding_ids 原样写入 audit.finding_ids（每批最多 5 个），summary 列出 finding ID 与验证角度；不要派与现有 open/running 意图重复的方向。\n" +
+	"- 深度候选按阶段派发：S3 数据流、S6 逻辑/合规、S7 Odin 深析、S9 深度放大使用候选的语言/模块；S8 设计验证与 S10 非执行 PoC 使用候选的 finding_ids，并等前置阶段完成后串行派发。\n" +
 	"- **代码审计意图必须带 audit.phase 与正整数 audit.round，且 round 必须等于 audit_progress.session.round；S11 报告阶段由服务端生成，禁止规划者创建 S11 意图。**\n" +
-	"- **硬底线**：审计未收敛（ready_to_complete=false）且没有任何 open/running 意图时，必须至少派一条可执行候选；candidates 为空时按 gates/coverage 缺口自行组织 S3/S5/S6 等意图（带 audit 字段）；**S4 必须带非空 sink_keys，无未认领站点时禁止创建空 S4**；**S5/S8 可以不带 sink_keys，但应带 finding_ids**；产出 0 意图只允许在已有意图推进或门禁已允许收尾时。\n" +
+	"- **硬底线**：审计未收敛（ready_to_complete=false）且没有任何 open/running 意图时，必须至少派一条可执行候选；candidates 为空时按 gates/coverage 缺口自行组织 S3/S5/S6 等意图（带 audit 字段）；**S4 必须带非空 sink_keys，无未认领站点时禁止创建空 S4**；**S5/S8/S10 可以不带 sink_keys，但应带 finding_ids**；产出 0 意图只允许在已有意图推进或门禁已允许收尾时。\n" +
 	"- **不得自行宣称覆盖完成**：覆盖与门禁以 audit_progress 为准；门禁未通过时继续派验证/补覆盖意图。\n" +
 	"- **只有 ready_to_complete=true 时才能 prove_goal**；高危候选优先派验证/反驳意图，而不是继续铺量。\n" +
 	"- 串行链用 TodoWrite 记录，只派前置已满足的步骤；不读代码、不请求 codegraph/code_search/code_read，也不使用 Bash/Read/Grep。"
@@ -723,7 +728,7 @@ type auditAssignedFindingView struct {
 
 func (t *ToolSet) auditAssignedFindings() actool.CoreTool {
 	return readTool("audit_assigned_findings",
-		"读取当前 S5/S8 验证意图在 audit.finding_ids 中明确指定的 finding（不是最新的漏洞列表）。S5/S8 意图通常没有 sink_keys，audit_assigned_coverage 会为空；请用本工具拿到待复核 finding 的 code_evidence，再用 update_finding_verification 写回确认/反驳结论。",
+		"读取当前 S5/S8/S10 意图在 audit.finding_ids 中明确指定的 finding（不是最新的漏洞列表）。这些意图通常没有 sink_keys，audit_assigned_coverage 会为空；请用本工具拿到待处理 finding 的 code_evidence，再分别用 update_finding_verification 写回验证/设计结论，或在 audit_artifact_write 中传 finding_id 绑定非执行 PoC。",
 		obj(map[string]any{
 			"intent_id": idp("可选；省略时默认当前 worker 领取的意图"),
 		}),
@@ -967,15 +972,19 @@ func auditArtifactRelativePath(raw string) (string, error) {
 
 func (t *ToolSet) auditArtifactWrite() actool.CoreTool {
 	return writeTool("audit_artifact_write",
-		"把本意图的中间产物（PoC、脚本、分析笔记等）写入本任务的 audit/artifacts 目录。path 必须是相对路径（例如 poc/cwe89_poc.py）；拒绝绝对路径、.. 逃逸、Windows 盘符/ADS（:）、保留设备名（CON/NUL/COM1..LPT9 等）和以点/空格结尾的路径段；单次内容上限 10 MiB。只写审计产物，不修改源码。",
+		"把本意图的中间产物（PoC、脚本、分析笔记等）写入本任务的 audit/artifacts 目录。path 必须是相对路径（例如 poc/cwe89_poc.py）；拒绝绝对路径、.. 逃逸、Windows 盘符/ADS（:）、保留设备名（CON/NUL/COM1..LPT9 等）和以点/空格结尾的路径段；单次内容上限 10 MiB。只写审计产物，不修改源码。S10 必须传 finding_id 与 description，服务端会把 PoC 绑定到分配给本意图的 finding，并记录 executed=false；禁止执行该 PoC。",
 		obj(map[string]any{
-			"path":    str("相对 audit/artifacts 的文件路径（必填）"),
-			"content": str("文件内容（必填）"),
+			"path":        str("相对 audit/artifacts 的文件路径（必填）"),
+			"content":     str("文件内容（必填）"),
+			"finding_id":  idp("S10 必填：audit_assigned_findings 返回且属于 audit.finding_ids 的 finding ID"),
+			"description": str("S10 必填：PoC 用途/前置条件/预期结果；明确说明未执行"),
 		}, "path", "content"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
-				Path    string `json:"path"`
-				Content string `json:"content"`
+				Path        string          `json:"path"`
+				Content     string          `json:"content"`
+				FindingID   json.RawMessage `json:"finding_id"`
+				Description string          `json:"description"`
 			}
 			if err := json.Unmarshal(in, &a); err != nil {
 				return actool.Errorf("audit_artifact_write: 参数解析失败: " + err.Error()), nil
@@ -990,12 +999,30 @@ func (t *ToolSet) auditArtifactWrite() actool.CoreTool {
 			if len(a.Content) > auditArtifactMaxBytes {
 				return actool.Errorf(fmt.Sprintf("audit_artifact_write: content 超过最大大小 %d 字节（本次 %d）", auditArtifactMaxBytes, len(a.Content))), nil
 			}
+			findingID := pid(a.FindingID)
+			if findingID < 0 {
+				return actool.Errorf("audit_artifact_write: finding_id 不能为负数"), nil
+			}
+			description := strings.TrimSpace(a.Description)
+			if findingID > 0 {
+				if t.taskID <= 0 || t.ownerNode <= 0 {
+					return actool.Errorf("audit_artifact_write: 绑定 PoC 需要任务上下文和当前意图"), nil
+				}
+				if description == "" {
+					return actool.Errorf("audit_artifact_write: 绑定 PoC 时 description 不能为空"), nil
+				}
+			}
 			stored, err := t.auditDeps.WriteAuditArtifact(ctx, t.taskID, cleaned, []byte(a.Content))
 			if err != nil {
 				return actool.Errorf("audit_artifact_write: " + err.Error()), nil
 			}
+			if findingID > 0 {
+				if err := t.auditDeps.AttachAuditPOC(ctx, t.taskID, findingID, t.ownerNode, stored, description); err != nil {
+					return actool.Errorf("audit_artifact_write: PoC 绑定失败: " + err.Error()), nil
+				}
+			}
 			t.writes.Artifacts++
-			return jsonResult(map[string]any{"path": cleaned, "stored_path": stored, "bytes": len(a.Content)})
+			return jsonResult(map[string]any{"path": cleaned, "stored_path": stored, "bytes": len(a.Content), "poc_bound": findingID > 0})
 		})
 }
 

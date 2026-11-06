@@ -33,7 +33,12 @@ import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetT
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { AssetInterceptRuleInput, TaskCategory, TaskTemplate } from "@/lib/types";
+import {
+  buildTaskTemplateAuditInput,
+  defaultTaskTemplateAuditConfigText,
+  taskTemplateAuditDraft,
+} from "@/lib/task-template-audit";
+import type { AssetInterceptRuleInput, TaskCategory, TaskMode, TaskTemplate } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 interface TemplateDraft {
@@ -42,6 +47,8 @@ interface TemplateDraft {
   goal: string;
   categoryID: number | null;
   interceptRules: AssetInterceptRuleInput[];
+  taskMode: TaskMode;
+  auditConfigText: string;
 }
 
 // TemplateSeed 是「另存为模板」时从创建表单带入的初值。
@@ -63,15 +70,20 @@ const emptyDraft = (): TemplateDraft => ({
   goal: "",
   categoryID: null,
   interceptRules: [],
+  taskMode: "pentest",
+  auditConfigText: "",
 });
 
 function templateDraft(template: TaskTemplate): TemplateDraft {
+  const audit = taskTemplateAuditDraft(template);
   return {
     name: template.name,
     description: template.description,
     goal: template.goal,
     categoryID: template.category_id ?? null,
     interceptRules: template.intercept_rules ?? [],
+    taskMode: audit.taskMode,
+    auditConfigText: audit.auditConfigText,
   };
 }
 
@@ -105,6 +117,7 @@ function TaskTemplateManager({
       if (seed) {
         setSelectedID(null);
         setDraft({
+          ...emptyDraft(),
           name: "",
           description: seed.description,
           goal: seed.goal,
@@ -132,8 +145,16 @@ function TaskTemplateManager({
     setDraft(emptyDraft());
   };
 
-  const updateDraft = (field: "name" | "description" | "goal", value: string) => {
+  const updateDraft = (field: "name" | "description" | "goal" | "auditConfigText", value: string) => {
     setDraft((current) => ({ ...current, [field]: value }));
+  };
+
+  const changeTaskMode = (mode: TaskMode) => {
+    setDraft((current) => ({
+      ...current,
+      taskMode: mode,
+      auditConfigText: mode === "pentest" ? "" : current.auditConfigText.trim() || defaultTaskTemplateAuditConfigText(),
+    }));
   };
 
   const patchDraft = (patch: Partial<TemplateDraft>) => {
@@ -154,16 +175,24 @@ function TaskTemplateManager({
       toast.error("请填写模板名称、描述和目标");
       return;
     }
+    let auditInput: Awaited<ReturnType<typeof buildTaskTemplateAuditInput>>;
+    try {
+      auditInput = await buildTaskTemplateAuditInput(draft.taskMode, draft.auditConfigText);
+    } catch (error) {
+      toast.error((error as Error).message);
+      return;
+    }
     setSaving(true);
     try {
+      const payload = { ...input, ...auditInput };
       if (selectedID == null) {
-        const created = await api.createTaskTemplate(input);
+        const created = await api.createTaskTemplate(payload);
         onCreated(created);
         setSelectedID(created.id);
         setDraft(templateDraft(created));
         toast.success("模板已创建");
       } else {
-        const updated = await api.updateTaskTemplate(selectedID, input);
+        const updated = await api.updateTaskTemplate(selectedID, payload);
         onUpdated(updated);
         setDraft(templateDraft(updated));
         toast.success("模板已更新");
@@ -207,7 +236,9 @@ function TaskTemplateManager({
         <SheetContent className="grid h-full w-full! max-w-none! grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:w-[48rem]! sm:max-w-[48rem]!">
           <SheetHeader className="border-b px-6 py-5">
             <SheetTitle>任务模板管理</SheetTitle>
-            <SheetDescription>模板保存描述、目标、分类与任务级拦截/允许规则；修改不会影响已经创建的任务。</SheetDescription>
+            <SheetDescription>
+              模板保存描述、目标、分类与任务级拦截/允许规则；修改不会影响已经创建的任务。
+            </SheetDescription>
           </SheetHeader>
           <div className="grid min-h-0 overflow-y-auto lg:grid-cols-[15rem_minmax(0,1fr)] lg:overflow-hidden">
             <div className="flex min-h-0 flex-col border-b p-3 lg:border-r lg:border-b-0">
@@ -230,7 +261,12 @@ function TaskTemplateManager({
                       )}
                       onClick={() => selectTemplate(template)}
                     >
-                      <span className="block truncate font-medium text-sm">{template.name}</span>
+                      <span className="flex min-w-0 items-center justify-between gap-2">
+                        <span className="truncate font-medium text-sm">{template.name}</span>
+                        <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                          {template.task_mode === "code_audit" ? "代码审计" : "渗透测试"}
+                        </span>
+                      </span>
                       <span className="block truncate text-muted-foreground text-xs">{template.description}</span>
                     </button>
                   ))}
@@ -288,6 +324,34 @@ function TaskTemplateManager({
                   </NativeSelect>
                   <FieldDescription>应用模板时预填此分类（可再改）。</FieldDescription>
                 </Field>
+                <Field>
+                  <FieldLabel htmlFor="task-template-mode">任务模式</FieldLabel>
+                  <NativeSelect
+                    id="task-template-mode"
+                    className="w-full"
+                    value={draft.taskMode}
+                    onChange={(event) => changeTaskMode(event.target.value === "code_audit" ? "code_audit" : "pentest")}
+                  >
+                    <NativeSelectOption value="pentest">渗透测试</NativeSelectOption>
+                    <NativeSelectOption value="code_audit">代码审计</NativeSelectOption>
+                  </NativeSelect>
+                  <FieldDescription>应用模板时预填任务模式；渗透测试模板不会携带审计配置。</FieldDescription>
+                </Field>
+                {draft.taskMode === "code_audit" && (
+                  <Field>
+                    <FieldLabel htmlFor="task-template-audit-config">审计配置（JSON）</FieldLabel>
+                    <Textarea
+                      id="task-template-audit-config"
+                      className="min-h-64 font-mono text-xs"
+                      value={draft.auditConfigText}
+                      spellCheck={false}
+                      onChange={(event) => updateDraft("auditConfigText", event.target.value)}
+                    />
+                    <FieldDescription>
+                      必须是 JSON 对象并包含 source_type、depth、cwe_scope；保存时由后端校验并归一化。
+                    </FieldDescription>
+                  </Field>
+                )}
                 <Field>
                   <FieldLabel>任务级拦截 / 允许规则</FieldLabel>
                   <AssetInterceptRulesEditor

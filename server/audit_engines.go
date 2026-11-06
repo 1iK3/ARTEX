@@ -21,10 +21,16 @@ import (
 )
 
 const (
-	auditEngineDefaultSeconds = 1800
-	auditEngineMaxSeconds     = 24 * 60 * 60
-	auditEngineGapLimit       = 32
-	auditEngineWarningLimit   = 64
+	auditEngineDefaultSeconds     = 1800
+	auditEngineMaxSeconds         = 24 * 60 * 60
+	auditEngineDefaultThreads     = 2
+	auditEngineMaxThreads         = 16
+	auditEngineDefaultRAMMB       = 4096
+	auditEngineMaxRAMMB           = 32768
+	auditEngineDefaultConcurrency = 1
+	auditEngineMaxConcurrency     = 4
+	auditEngineGapLimit           = 32
+	auditEngineWarningLimit       = 64
 )
 
 // auditEngineRun is the result of one optional-engine pass during preflight. It
@@ -53,11 +59,24 @@ type auditEngineSiteEvidence struct {
 // preflight. It keeps the legacy mode map under "configured" so older readers
 // can still recover the operator's choices.
 type auditEnginesRecord struct {
-	Configured   map[string]string             `json:"configured,omitempty"`
-	Capabilities map[string]engines.Capability `json:"capabilities,omitempty"`
-	Prepared     map[string]engines.Prepared   `json:"prepared,omitempty"`
-	Warnings     []string                      `json:"warnings,omitempty"`
-	Gaps         []string                      `json:"gaps,omitempty"`
+	Configured     map[string]string             `json:"configured,omitempty"`
+	Capabilities   map[string]engines.Capability `json:"capabilities,omitempty"`
+	Prepared       map[string]engines.Prepared   `json:"prepared,omitempty"`
+	IntentAnalysis *auditIntentAnalysisRecord    `json:"intent_analysis,omitempty"`
+	Warnings       []string                      `json:"warnings,omitempty"`
+	Gaps           []string                      `json:"gaps,omitempty"`
+}
+
+type auditIntentAnalysisRecord struct {
+	RecognitionSource string   `json:"recognition_source"`
+	Model             string   `json:"model,omitempty"`
+	PromptVersion     string   `json:"prompt_version,omitempty"`
+	RawOutputHash     string   `json:"raw_output_hash,omitempty"`
+	RepairAttempts    int      `json:"repair_attempts,omitempty"`
+	IntentCount       int      `json:"intent_count,omitempty"`
+	Fallback          bool     `json:"fallback,omitempty"`
+	Error             string   `json:"error,omitempty"`
+	QueryGaps         []string `json:"query_gaps,omitempty"`
 }
 
 // auditMergedSinkSites is the prescan+engine sink inventory. EngineOnly records
@@ -96,6 +115,7 @@ func (d *AuditDirector) runAuditEngines(ctx context.Context, t *Task, cfg audit.
 	for name, mode := range cfg.Engines {
 		configured[strings.ToLower(strings.TrimSpace(name))] = strings.ToLower(strings.TrimSpace(mode))
 	}
+	enabled := enabledAuditEngines(cfg)
 	gaps := make([]string, 0)
 	gapSeen := make(map[string]struct{})
 	addGap := func(message string) {
@@ -126,8 +146,32 @@ func (d *AuditDirector) runAuditEngines(ctx context.Context, t *Task, cfg audit.
 		addGap("检测意图生成失败，引擎检测已跳过")
 		intents = []engines.DetectionIntent{}
 	}
+	var intentAnalysis *auditIntentAnalysisRecord
+	if t != nil && strings.TrimSpace(t.Goal) != "" {
+		runtime := &taskLLMRuntime{s: d.s, taskID: t.ID, agentKey: "code-audit-intent"}
+		analyst := &engines.IntentAnalyst{Provider: &auditIntentLLMProvider{runtime: runtime}}
+		analysis, analysisErr := analyst.Analyze(ctx, engines.IntentAnalystInput{
+			Goal:        t.Goal,
+			Languages:   plan.Languages,
+			Registry:    reg,
+			EngineNames: enabled,
+			MaxTokens:   auditBudgetInt(cfg, "llm_intent_max_tokens"),
+		})
+		intents, intentAnalysis = mergeAuditIntentAnalysis(intents, analysis, analysisErr)
+		if intentAnalysis != nil && intentAnalysis.Fallback {
+			message := "LLM 意图识别失败: " + intentAnalysis.Error
+			addWarning(message)
+			for _, gap := range intentAnalysis.QueryGaps {
+				addGap(gap)
+			}
+		}
+	}
 	intentDBIDs := make(map[string]int64, len(intents))
 	for _, intent := range intents {
+		provenance := intent.Provenance
+		if provenance == nil {
+			provenance = map[string]any{}
+		}
 		record := db.AuditDetectionIntent{
 			SessionID:        session.ID,
 			Round:            1,
@@ -144,6 +188,7 @@ func (d *AuditDirector) runAuditEngines(ctx context.Context, t *Task, cfg audit.
 			Scope:            auditEngineJSON(intent.Scope),
 			Constraints:      auditEngineJSON(intent.Constraints),
 			PreferredEngines: auditEngineJSON(intent.PreferredEngines),
+			Provenance:       auditEngineJSON(provenance),
 			Priority:         intent.Priority,
 			Status:           "planned",
 		}
@@ -156,12 +201,12 @@ func (d *AuditDirector) runAuditEngines(ctx context.Context, t *Task, cfg audit.
 		}
 	}
 
-	enabled := enabledAuditEngines(cfg)
 	if len(enabled) == 0 {
 		run.EnginesJSON, _ = json.Marshal(auditEnginesRecord{
 			Configured: configured, Capabilities: run.Capabilities, Prepared: run.Prepared,
-			Warnings: sanitizeAuditEngineMessages(run.Warnings, nil),
-			Gaps:     sanitizeAuditEngineMessages(gaps, nil),
+			IntentAnalysis: intentAnalysis,
+			Warnings:       sanitizeAuditEngineMessages(run.Warnings, nil),
+			Gaps:           sanitizeAuditEngineMessages(gaps, nil),
 		})
 		return run, nil
 	}
@@ -169,8 +214,9 @@ func (d *AuditDirector) runAuditEngines(ctx context.Context, t *Task, cfg audit.
 		addWarning("引擎检测在开始前已被取消")
 		run.EnginesJSON, _ = json.Marshal(auditEnginesRecord{
 			Configured: configured, Capabilities: run.Capabilities, Prepared: run.Prepared,
-			Warnings: sanitizeAuditEngineMessages(run.Warnings, nil),
-			Gaps:     sanitizeAuditEngineMessages(gaps, nil),
+			IntentAnalysis: intentAnalysis,
+			Warnings:       sanitizeAuditEngineMessages(run.Warnings, nil),
+			Gaps:           sanitizeAuditEngineMessages(gaps, nil),
 		})
 		return run, nil
 	}
@@ -189,7 +235,7 @@ func (d *AuditDirector) runAuditEngines(ctx context.Context, t *Task, cfg audit.
 	}
 
 	engineTimeout := auditEngineTimeout(cfg)
-	ramMB := auditBudgetInt(cfg, "codeql_ram_mb")
+	ramMB := auditEngineRAMMB(cfg)
 	runners := make([]engines.Engine, 0, len(enabled))
 	enginePaths := make([]string, 0, 8)
 	for _, name := range enabled {
@@ -199,6 +245,7 @@ func (d *AuditDirector) runAuditEngines(ctx context.Context, t *Task, cfg audit.
 			runner.SearchPath = d.s.auditEngineSetting("ARTEX_CODEQL_SEARCH_PATH", "audit.codeql_search_path", "")
 			runner.DBPath = d.s.auditEngineSetting("ARTEX_CODEQL_DB_PATH", "audit.codeql_db_path", "")
 			runner.RAMMB = ramMB
+			runner.Threads = auditEngineThreads(cfg)
 			runner.Timeout = engineTimeout
 			enginePaths = append(enginePaths, runner.Bin, filepath.Dir(runner.Bin), runner.SearchPath, runner.DBPath)
 			enginePaths = append(enginePaths, filepath.SplitList(runner.SearchPath)...)
@@ -225,6 +272,7 @@ func (d *AuditDirector) runAuditEngines(ctx context.Context, t *Task, cfg audit.
 		addWarning("未配置可运行的检测引擎适配器")
 	}
 	manager := engines.NewManager(runners...)
+	manager.SetEngineConcurrency(auditEngineConcurrency(cfg))
 	run.Capabilities = manager.ProbeAll(ctx)
 
 	available := make([]string, 0, len(enabled))
@@ -327,7 +375,7 @@ func (d *AuditDirector) runAuditEngines(ctx context.Context, t *Task, cfg audit.
 	gaps = sanitizeAuditEngineMessages(gaps, redactions)
 	record := sanitizeAuditEnginesRecord(auditEnginesRecord{
 		Configured: configured, Capabilities: run.Capabilities, Prepared: run.Prepared,
-		Warnings: run.Warnings, Gaps: gaps,
+		IntentAnalysis: intentAnalysis, Warnings: run.Warnings, Gaps: gaps,
 	}, redactions)
 	raw, marshalErr := json.Marshal(record)
 	if marshalErr != nil {
@@ -335,6 +383,51 @@ func (d *AuditDirector) runAuditEngines(ctx context.Context, t *Task, cfg audit.
 	}
 	run.EnginesJSON = raw
 	return run, nil
+}
+
+func mergeAuditIntentAnalysis(
+	deterministic []engines.DetectionIntent,
+	analysis engines.IntentAnalysisResult,
+	analysisErr error,
+) ([]engines.DetectionIntent, *auditIntentAnalysisRecord) {
+	if analysisErr != nil {
+		record := auditIntentAnalysisRecordFromProvenance(analysis.Provenance)
+		record.RecognitionSource = "fallback"
+		record.Fallback = true
+		record.Error = analysisErr.Error()
+		record.QueryGaps = []string{"LLM 意图识别失败，已回退确定性 sink 意图"}
+		return append([]engines.DetectionIntent(nil), deterministic...), record
+	}
+	record := auditIntentAnalysisRecordFromProvenance(analysis.Provenance)
+	record.IntentCount = len(analysis.Intents)
+	if record.RecognitionSource == "" {
+		record.RecognitionSource = "llm"
+	}
+	merged := append([]engines.DetectionIntent(nil), deterministic...)
+	merged = append(merged, analysis.Intents...)
+	return merged, record
+}
+
+func auditIntentAnalysisRecordFromProvenance(provenance map[string]any) *auditIntentAnalysisRecord {
+	record := &auditIntentAnalysisRecord{
+		RecognitionSource: auditIntentProvenanceString(provenance["recognition_source"]),
+		Model:             auditIntentProvenanceString(provenance["model"]),
+		PromptVersion:     auditIntentProvenanceString(provenance["prompt_version"]),
+		RawOutputHash:     auditIntentProvenanceString(provenance["raw_output_hash"]),
+		RepairAttempts:    auditIntentProvenanceInt(provenance["repair_attempts"]),
+		QueryGaps:         []string{},
+	}
+	return record
+}
+
+func auditIntentProvenanceString(value any) string {
+	text, _ := value.(string)
+	return text
+}
+
+func auditIntentProvenanceInt(value any) int {
+	number, _ := value.(int)
+	return number
 }
 
 // emitAuditEngineActivity reports availability, job outcomes, finding/site
@@ -414,6 +507,39 @@ func auditEngineTimeout(cfg audit.Config) time.Duration {
 		seconds = auditEngineMaxSeconds
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+func auditEngineThreads(cfg audit.Config) int {
+	threads := auditBudgetInt(cfg, "codeql_threads")
+	if threads <= 0 {
+		threads = auditEngineDefaultThreads
+	}
+	if threads > auditEngineMaxThreads {
+		threads = auditEngineMaxThreads
+	}
+	return threads
+}
+
+func auditEngineRAMMB(cfg audit.Config) int {
+	ramMB := auditBudgetInt(cfg, "codeql_ram_mb")
+	if ramMB <= 0 {
+		ramMB = auditEngineDefaultRAMMB
+	}
+	if ramMB > auditEngineMaxRAMMB {
+		ramMB = auditEngineMaxRAMMB
+	}
+	return ramMB
+}
+
+func auditEngineConcurrency(cfg audit.Config) int {
+	concurrency := auditBudgetInt(cfg, "engine_concurrency")
+	if concurrency <= 0 {
+		return auditEngineDefaultConcurrency
+	}
+	if concurrency > auditEngineMaxConcurrency {
+		return auditEngineMaxConcurrency
+	}
+	return concurrency
 }
 
 // auditEngineSetting resolves an operator override from env, then the settings
@@ -1028,11 +1154,15 @@ func sanitizeAuditEngineMessages(messages []string, redactPaths []string) []stri
 // process as absolute paths.
 func sanitizeAuditEnginesRecord(record auditEnginesRecord, redactPaths []string) auditEnginesRecord {
 	out := auditEnginesRecord{
-		Configured:   make(map[string]string, len(record.Configured)),
-		Capabilities: make(map[string]engines.Capability, len(record.Capabilities)),
-		Prepared:     make(map[string]engines.Prepared, len(record.Prepared)),
-		Warnings:     sanitizeAuditEngineMessages(record.Warnings, redactPaths),
-		Gaps:         sanitizeAuditEngineMessages(record.Gaps, redactPaths),
+		Configured:     make(map[string]string, len(record.Configured)),
+		Capabilities:   make(map[string]engines.Capability, len(record.Capabilities)),
+		Prepared:       make(map[string]engines.Prepared, len(record.Prepared)),
+		IntentAnalysis: sanitizeAuditIntentAnalysisRecord(record.IntentAnalysis, redactPaths),
+		Warnings:       sanitizeAuditEngineMessages(record.Warnings, redactPaths),
+		Gaps:           sanitizeAuditEngineMessages(record.Gaps, redactPaths),
+	}
+	if record.IntentAnalysis != nil {
+		out.IntentAnalysis = sanitizeAuditIntentAnalysisRecord(record.IntentAnalysis, redactPaths)
 	}
 	for name, mode := range record.Configured {
 		out.Configured[name] = sanitizeAuditText(mode, redactPaths)
@@ -1071,6 +1201,17 @@ func sanitizeAuditEnginesRecord(record auditEnginesRecord, redactPaths []string)
 		out.Prepared[name] = prepared
 	}
 	return out
+}
+
+func sanitizeAuditIntentAnalysisRecord(record *auditIntentAnalysisRecord, redactPaths []string) *auditIntentAnalysisRecord {
+	if record == nil {
+		return nil
+	}
+	out := *record
+	out.Model = sanitizeAuditText(out.Model, redactPaths)
+	out.Error = sanitizeAuditText(out.Error, redactPaths)
+	out.QueryGaps = sanitizeAuditEngineMessages(out.QueryGaps, redactPaths)
+	return &out
 }
 
 // parseAuditEnginesRecord accepts both the legacy mode map
@@ -1126,6 +1267,7 @@ func parseAuditEnginesRecord(raw json.RawMessage) auditEnginesRecord {
 	}
 	record.Warnings = append([]string(nil), combined.Warnings...)
 	record.Gaps = append([]string(nil), combined.Gaps...)
+	record.IntentAnalysis = combined.IntentAnalysis
 	return record
 }
 

@@ -1,0 +1,177 @@
+# syntax=docker/dockerfile:1
+
+########## 阶段 1：前端静态导出 ##########
+FROM node:20-bookworm AS web
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm config set registry "$NPM_REGISTRY" && npm ci --ignore-scripts
+COPY web/ ./
+RUN NEXT_EXPORT=1 npm run build:static
+
+########## 阶段 2：Go 后端（内嵌前端） ##########
+FROM golang:1.26-bookworm AS gobuild
+ARG TARGETARCH
+ARG GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY norma/go.mod norma/go.sum ./norma/
+RUN go mod download
+COPY . .
+COPY --from=web /web/out/ server/webui/dist/
+RUN CGO_ENABLED=0 GOARCH="${TARGETARCH}" go build -tags embedui -trimpath -o /out/artex ./cmd/artex
+
+########## 阶段 3：Kali + 审计引擎 + PostgreSQL ##########
+FROM kalilinux/kali-rolling:latest
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG CODEQL_VERSION=2.27.3
+ARG JOERN_VERSION=4.0.535
+ARG CODEX_CLI_VERSION=0.166.0
+ARG OPENCODE_CLI_VERSION=1.19.5
+ARG CLAUDE_CODE_CLI_VERSION=2.1.317
+ARG CTF_SUPER_HUB_REPO=https://github.com/1iK3/ctf-super-hub.git
+ARG CTF_SUPER_HUB_REF=7715719738578b36b0a84b74aeb0de41bda0eaae
+ARG CTF_SKILLS_REPO=https://github.com/1iK3/ctf-skills.git
+ARG CTF_SKILLS_REF=aabc3ef61db9231ba7005e90b11c7b9bcde410f9
+ARG GITHUB_PROXY=https://gh-proxy.com/
+
+LABEL org.opencontainers.image.title="Artex Kali Audit Runtime" \
+      org.opencontainers.image.description="ARTEX code-audit branch with Kali tools, CodeGraph, CodeQL, Joern and PostgreSQL" \
+      org.opencontainers.image.source="https://github.com/1iK3/ARTEX"
+
+ENV npm_config_registry="$NPM_REGISTRY" \
+    PGDATA=/var/lib/postgresql/data \
+    POSTGRES_USER=artex \
+    POSTGRES_PASSWORD=artex \
+    POSTGRES_DB=artex \
+    ARTEX_CONFIG=/app/config.json \
+    ARTEX_SKILL_DIR=/app/skills \
+    ARTEX_CODEGRAPH_BIN=/usr/local/bin/codegraph \
+    ARTEX_CODEQL_BIN=/opt/codeql/codeql \
+    ARTEX_CODEQL_SEARCH_PATH=/opt/codeql/packages \
+    ARTEX_JOERN_BIN=/opt/joern/joern \
+    ARTEX_JOERN_PARSE_BIN=/opt/joern/joern-parse \
+    ARTEX_AUDIT_LOCAL_ROOTS=/workspaces \
+    JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+
+RUN printf '%s\n' \
+      'Types: deb' \
+      'URIs: http://mirrors.tuna.tsinghua.edu.cn/kali' \
+      'Suites: kali-rolling' \
+      'Components: main contrib non-free non-free-firmware' \
+      'Signed-By: /usr/share/keyrings/kali-archive-keyring.gpg' \
+      > /etc/apt/sources.list.d/kali.sources \
+    && rm -f /etc/apt/sources.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl wget git jq unzip ripgrep vim \
+      dnsutils iputils-ping netcat-openbsd nmap sqlmap gobuster ffuf \
+      python3 python3-pip build-essential \
+      postgresql postgresql-client openjdk-21-jdk-headless \
+      nodejs npm tini \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @colbymchenry/codegraph@latest \
+    && codegraph --version
+
+RUN npm install -g \
+      --allow-scripts=@openai/codex,opencode-ai,@anthropic-ai/claude-code \
+      @openai/codex@${CODEX_CLI_VERSION} \
+      opencode-ai@${OPENCODE_CLI_VERSION} \
+      @anthropic-ai/claude-code@${CLAUDE_CODE_CLI_VERSION} \
+    && codex --version \
+    && opencode --version \
+    && claude --version
+
+RUN apt-get update -qq && apt-get install -y --no-install-recommends aria2 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN aria2c --file-allocation=none --continue=true --max-tries=10 --retry-wait=5 \
+      --split=16 --max-connection-per-server=16 --min-split-size=8M \
+      --dir=/tmp --out=codeql.zip \
+      "${GITHUB_PROXY}https://github.com/github/codeql-cli-binaries/releases/download/v${CODEQL_VERSION}/codeql-linux64.zip"
+
+RUN unzip -q /tmp/codeql.zip -d /opt \
+    && rm /tmp/codeql.zip \
+    && /opt/codeql/codeql version \
+    && mkdir -p /opt/codeql/packages
+
+RUN /opt/codeql/codeql pack download --dir /opt/codeql/packages \
+      codeql/java-all@9.2.0 \
+      codeql/python-all@7.2.8 \
+      codeql/javascript-all@2.10.4
+
+RUN aria2c --file-allocation=none --continue=true --max-tries=10 --retry-wait=5 \
+      --split=16 --max-connection-per-server=16 --min-split-size=8M \
+      --dir=/tmp --out=joern.zip \
+      "${GITHUB_PROXY}https://github.com/joernio/joern/releases/download/v${JOERN_VERSION}/joern-cli.zip"
+
+RUN unzip -q /tmp/joern.zip -d /opt/joern-dist \
+    && joern_bin="$(find /opt/joern-dist -type f -name joern -print -quit)" \
+    && joern_root="$(dirname "$joern_bin")" \
+    && rm -rf /opt/joern \
+    && mv "$joern_root" /opt/joern \
+    && chmod +x /opt/joern/joern /opt/joern/joern-parse \
+    && rm -rf /opt/joern-dist /tmp/joern.zip \
+    && /opt/joern/joern --help >/dev/null
+
+ENV SAPPER_BIN=codex-wrapper \
+    SAPPER_MODEL=deepseek-v4.1-flash \
+    SAPPER_ROOT=/workspaces
+
+WORKDIR /app
+COPY docker/kali-audit/sapper-v2 /opt/sapper
+COPY docker/kali-audit/codex-wrapper /usr/local/bin/codex-wrapper
+COPY db/schema.sql /tmp/artex-schema.sql
+RUN chmod +x /opt/sapper/lib/sapper.py /usr/local/bin/codex-wrapper \
+    && ln -sf /opt/sapper/lib/sapper.py /usr/local/bin/sapper \
+    && mkdir -p /root/.claude/skills /workspaces \
+    && ln -sfn /opt/sapper/skill /root/.claude/skills/sapper-setup \
+    && pg_bin_dir="$(dirname "$(find /usr/lib/postgresql -mindepth 3 -maxdepth 3 -type f -name initdb | sort -V | tail -1)")" \
+    && export PATH="$pg_bin_dir:$PATH" \
+    && install -d -m 700 -o postgres -g postgres "$PGDATA" /var/log/postgresql /var/run/postgresql \
+    && runuser -u postgres -- initdb -D "$PGDATA" --username=postgres --auth=trust \
+    && runuser -u postgres -- pg_ctl -D "$PGDATA" \
+      -l /tmp/artex-postgresql.log \
+      -o "-c listen_addresses=127.0.0.1" -w start \
+    && printf "CREATE ROLE :\"user\" LOGIN PASSWORD :'password';\n" \
+      | psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 \
+        -v user="$POSTGRES_USER" -v password="$POSTGRES_PASSWORD" \
+    && createdb -h 127.0.0.1 -U postgres -O "$POSTGRES_USER" "$POSTGRES_DB" \
+    && psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+      -v ON_ERROR_STOP=1 -f /tmp/artex-schema.sql >/tmp/artex-schema.log \
+    && runuser -u postgres -- pg_ctl -D "$PGDATA" -m fast -w stop \
+    && rm -f /tmp/artex-schema.sql /tmp/artex-schema.log /tmp/artex-postgresql.log \
+    && sapper --version \
+    && test -x /usr/local/bin/codex-wrapper
+COPY --from=gobuild /out/artex /app/artex
+COPY start.sh /app/start.sh
+COPY docker/kali-audit/entrypoint.sh /app/entrypoint.sh
+COPY config.kali-audit.json /app/config.json
+COPY skills/ /app/skills/
+RUN git init /tmp/ctf-super-hub \
+    && git -C /tmp/ctf-super-hub remote add origin "$CTF_SUPER_HUB_REPO" \
+    && git -C /tmp/ctf-super-hub fetch --depth 1 origin "$CTF_SUPER_HUB_REF" \
+    && git -C /tmp/ctf-super-hub checkout --detach FETCH_HEAD \
+    && rm -rf /tmp/ctf-super-hub/.git \
+    && mv /tmp/ctf-super-hub /opt/ctf-super-hub \
+    && git init /tmp/ctf-skills \
+    && git -C /tmp/ctf-skills remote add origin "$CTF_SKILLS_REPO" \
+    && git -C /tmp/ctf-skills fetch --depth 1 origin "$CTF_SKILLS_REF" \
+    && git -C /tmp/ctf-skills checkout --detach FETCH_HEAD \
+    && rm -rf /tmp/ctf-skills/.git \
+    && mv /tmp/ctf-skills /opt/ctf-skills \
+    && mkdir -p /root/.agents/skills \
+    && cp -R /opt/ctf-skills/ctf-* /opt/ctf-skills/solve-challenge /root/.agents/skills/
+
+RUN chmod +x /app/artex /app/start.sh /app/entrypoint.sh \
+    && mkdir -p /app/data /workspaces /var/log/postgresql /var/run/postgresql \
+    && rm -rf /root/.codex /root/.config/opencode /root/.local/share/opencode \
+    && chown -R postgres:postgres /var/log/postgresql /var/run/postgresql
+
+VOLUME ["/app/data", "/var/lib/postgresql/data", "/workspaces"]
+EXPOSE 8787 8788
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
+  CMD curl -fsS http://127.0.0.1:8787/api/health || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
+CMD ["-addr", ":8787", "-proxy", ":8788"]

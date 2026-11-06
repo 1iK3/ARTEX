@@ -665,6 +665,35 @@ RETURNING id`, domainB, companyB).Scan(&companyAssetB); err != nil {
 	}
 }
 
+func TestCreateTaskNormalizesWorkerConfig(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer d.Close()
+
+	plain, err := d.CreateTaskWithOptions("worker config normalization", "goal", TaskCreateOptions{})
+	if err != nil {
+		t.Fatalf("create without worker config: %v", err)
+	}
+	t.Cleanup(func() { _ = d.DeleteTask(plain.ID) })
+	if string(plain.WorkerConfig) != "{}" {
+		t.Fatalf("plain task worker_config = %q, want {}", plain.WorkerConfig)
+	}
+
+	configured, err := d.CreateTaskWithOptions("worker config normalization", "goal", TaskCreateOptions{
+		WorkerConfig: []byte(`{"backend":"codex","mode":"static","command":"codex","args":["exec","{{prompt}}"]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.DeleteTask(configured.ID) })
+	var backend string
+	if err := d.QueryRow(`SELECT worker_config->>'backend' FROM tasks WHERE id=$1`, configured.ID).Scan(&backend); err != nil || backend != "codex" {
+		t.Fatalf("persisted worker_config backend = %q (err %v)", backend, err)
+	}
+}
+
 // TestListTasksOrderByIDDesc pins list ordering to id-descending. created_at is
 // deliberately not the sort key: tasks created in the same instant share a
 // timestamp and would reorder between polls; id is unique and monotonic.

@@ -1,0 +1,5 @@
+library: true
+name: codeql/java-all
+version: 9.2.0
+dependencies:
+  codeql/util: 2.0.47

@@ -31,6 +31,13 @@ web/next-env.d.ts
 .DS_Store
 Thumbs.db
 
+# local Docker artifacts and fetched dependencies
+/exports/
+/artex-linux
+/artex.exe
+/docker/kali-audit/ctf-repos/
+/docker/kali-audit/agent-skills/
+
 # claude code local state
 .claude/
 

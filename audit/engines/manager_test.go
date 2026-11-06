@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Autumn-27/artex/audit"
 )
@@ -62,6 +64,49 @@ func TestManagerCapabilityGating(t *testing.T) {
 	}
 	if result := resultForEngine(t, results, EngineCodeQL); result.QueryHash == "" {
 		t.Error("done job has no query hash")
+	}
+}
+
+func TestRunIntentsEngineConcurrencyLimit(t *testing.T) {
+	names := []string{EngineCodeQL, EngineJoern, EngineCodeGraph}
+	engines := make([]*fakeEngine, 0, len(names))
+	var mu sync.Mutex
+	active := 0
+	maxActive := 0
+	for _, name := range names {
+		engine := fakeWithCapability(name, audit.Java)
+		engine.runFn = func(ctx context.Context, q QuerySpec) ([]EngineFinding, error) {
+			mu.Lock()
+			active++
+			if active > maxActive {
+				maxActive = active
+			}
+			mu.Unlock()
+			time.Sleep(20 * time.Millisecond)
+			mu.Lock()
+			active--
+			mu.Unlock()
+			return nil, nil
+		}
+		engines = append(engines, engine)
+	}
+
+	manager := NewManager(engines[0], engines[1], engines[2])
+	manager.SetEngineConcurrency(2)
+	intent := testJavaTaintIntent()
+	intent.PreferredEngines = names
+
+	_, results := manager.RunIntents(context.Background(), []DetectionIntent{intent}, nil)
+	if maxActive != 2 {
+		t.Fatalf("max concurrent engine runs = %d, want 2", maxActive)
+	}
+	if len(results) != len(names) {
+		t.Fatalf("job results = %d, want %d", len(results), len(names))
+	}
+	for index, result := range results {
+		if result.Engine != names[index] || result.Status != JobStatusDone {
+			t.Fatalf("job result %d = %+v, want engine %s done", index, result, names[index])
+		}
 	}
 }
 
@@ -252,6 +297,42 @@ func TestManagerQueryCacheHit(t *testing.T) {
 	}
 	if _, _, validateCalls, runCalls := engine.counts(); validateCalls != 2 || runCalls != 2 {
 		t.Errorf("engine calls = %d/%d, want 2/2", validateCalls, runCalls)
+	}
+}
+
+func TestManagerQueryHashIncludesEngineVersionAndCommit(t *testing.T) {
+	intent := testJavaTaintIntent()
+	intent.PreferredEngines = []string{EngineCodeQL}
+
+	versionA := fakeWithCapability(EngineCodeQL, audit.Java)
+	versionA.capability.Version = "1.0.0"
+	versionB := fakeWithCapability(EngineCodeQL, audit.Java)
+	versionB.capability.Version = "1.0.1"
+	_, resultsA := NewManager(versionA).RunIntents(context.Background(), []DetectionIntent{intent}, nil)
+	_, resultsB := NewManager(versionB).RunIntents(context.Background(), []DetectionIntent{intent}, nil)
+	hashA := resultForEngine(t, resultsA, EngineCodeQL).QueryHash
+	hashB := resultForEngine(t, resultsB, EngineCodeQL).QueryHash
+	if hashA == "" || hashA == hashB {
+		t.Fatalf("engine-version query hashes = %q / %q, want distinct", hashA, hashB)
+	}
+
+	engine := fakeWithCapability(EngineCodeQL, audit.Java)
+	manager := NewManager(engine)
+	source := SourceRef{Root: "source", Languages: []string{audit.Java}}
+	source.Commit = "0123456789abcdef"
+	if _, failures := manager.PrepareAll(context.Background(), source, []string{audit.Java}, PrepareOptions{}); len(failures) != 0 {
+		t.Fatalf("PrepareAll: %v", failures)
+	}
+	_, firstResults := manager.RunIntents(context.Background(), []DetectionIntent{intent}, nil)
+	source.Commit = "fedcba9876543210"
+	if _, failures := manager.PrepareAll(context.Background(), source, []string{audit.Java}, PrepareOptions{}); len(failures) != 0 {
+		t.Fatalf("PrepareAll second commit: %v", failures)
+	}
+	_, secondResults := manager.RunIntents(context.Background(), []DetectionIntent{intent}, nil)
+	firstHash := resultForEngine(t, firstResults, EngineCodeQL).QueryHash
+	secondHash := resultForEngine(t, secondResults, EngineCodeQL).QueryHash
+	if firstHash == "" || firstHash == secondHash {
+		t.Fatalf("commit query hashes = %q / %q, want distinct", firstHash, secondHash)
 	}
 }
 

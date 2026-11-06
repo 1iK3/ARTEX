@@ -33,16 +33,20 @@ const (
 	OriginUserGoal         = "user_goal"
 	OriginPhaseRequirement = "phase_requirement"
 	OriginEngineProbe      = "engine_probe"
+	OriginLLM              = "llm"
 )
 
 // Query kinds carried by DetectionIntent and QuerySpec.
 const (
-	QueryKindSink        = "sink"
-	QueryKindTaint       = "taint"
-	QueryKindControlFlow = "control_flow"
-	QueryKindCallGraph   = "callgraph"
-	QueryKindDataflow    = "dataflow"
-	QueryKindLogic       = "logic"
+	QueryKindSink            = "sink"
+	QueryKindTaint           = "taint"
+	QueryKindControlFlow     = "control_flow"
+	QueryKindCallGraph       = "callgraph"
+	QueryKindDataflow        = "dataflow"
+	QueryKindLogic           = "logic"
+	QueryKindErrorContract   = "error_contract"
+	QueryKindStateTransition = "state_transition"
+	QueryKindInvariant       = "invariant"
 )
 
 // Pattern match modes.
@@ -112,20 +116,21 @@ var (
 // output of deterministic intent recognition and the only input to query
 // synthesis.
 type DetectionIntent struct {
-	ID               string      `json:"id"`
-	Origin           string      `json:"origin"`
-	Language         string      `json:"language"`
-	CWE              string      `json:"cwe"`
-	Title            string      `json:"title"`
-	QueryKind        string      `json:"query_kind"`
-	Sources          []Pattern   `json:"sources,omitempty"`
-	Sinks            []Pattern   `json:"sinks,omitempty"`
-	Sanitizers       []Pattern   `json:"sanitizers,omitempty"`
-	Propagators      []Pattern   `json:"propagators,omitempty"`
-	Scope            Scope       `json:"scope"`
-	Constraints      Constraints `json:"constraints"`
-	PreferredEngines []string    `json:"preferred_engines,omitempty"`
-	Priority         int         `json:"priority"`
+	ID               string         `json:"id"`
+	Origin           string         `json:"origin"`
+	Language         string         `json:"language"`
+	CWE              string         `json:"cwe"`
+	Title            string         `json:"title"`
+	QueryKind        string         `json:"query_kind"`
+	Sources          []Pattern      `json:"sources,omitempty"`
+	Sinks            []Pattern      `json:"sinks,omitempty"`
+	Sanitizers       []Pattern      `json:"sanitizers,omitempty"`
+	Propagators      []Pattern      `json:"propagators,omitempty"`
+	Scope            Scope          `json:"scope"`
+	Constraints      Constraints    `json:"constraints"`
+	PreferredEngines []string       `json:"preferred_engines,omitempty"`
+	Priority         int            `json:"priority"`
+	Provenance       map[string]any `json:"provenance,omitempty"`
 }
 
 // Pattern is one detection symbol. Match is method_call, type, or regex.
@@ -158,18 +163,22 @@ type Constraints struct {
 // adapter. QueryText is engine-specific but always generated from a registered
 // template; adapters never receive arbitrary free-form text from an LLM.
 type QuerySpec struct {
-	ID             string         `json:"id"`
-	IntentID       string         `json:"intent_id"`
-	Engine         string         `json:"engine"`
-	Language       string         `json:"language"`
-	QueryKind      string         `json:"query_kind"`
-	Template       string         `json:"template"`
-	QueryText      string         `json:"query_text"`
-	QueryPath      string         `json:"query_path,omitempty"`
-	ExpectedFormat string         `json:"expected_format"`
-	GeneratedBy    string         `json:"generated_by"`
-	Params         map[string]any `json:"params,omitempty"`
-	Provenance     map[string]any `json:"provenance,omitempty"`
+	ID              string         `json:"id"`
+	IntentID        string         `json:"intent_id"`
+	Engine          string         `json:"engine"`
+	Language        string         `json:"language"`
+	QueryKind       string         `json:"query_kind"`
+	Template        string         `json:"template"`
+	TemplateVersion string         `json:"template_version,omitempty"`
+	EngineVersion   string         `json:"engine_version,omitempty"`
+	Commit          string         `json:"commit,omitempty"`
+	IRHash          string         `json:"ir_hash,omitempty"`
+	QueryText       string         `json:"query_text"`
+	QueryPath       string         `json:"query_path,omitempty"`
+	ExpectedFormat  string         `json:"expected_format"`
+	GeneratedBy     string         `json:"generated_by"`
+	Params          map[string]any `json:"params,omitempty"`
+	Provenance      map[string]any `json:"provenance,omitempty"`
 	// ArtifactPath is a runtime-only pointer to the prepared database or CPG
 	// for this query. It is populated by the manager and deliberately excluded
 	// from the query cache key.
@@ -281,7 +290,8 @@ func normalizeEngineName(name string) string {
 
 func validQueryKind(kind string) bool {
 	switch kind {
-	case QueryKindSink, QueryKindTaint, QueryKindControlFlow, QueryKindCallGraph, QueryKindDataflow, QueryKindLogic:
+	case QueryKindSink, QueryKindTaint, QueryKindControlFlow, QueryKindCallGraph, QueryKindDataflow, QueryKindLogic,
+		QueryKindErrorContract, QueryKindStateTransition, QueryKindInvariant:
 		return true
 	default:
 		return false

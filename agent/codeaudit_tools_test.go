@@ -75,6 +75,14 @@ type fakeAuditDeps struct {
 	artifactCalls   int
 	artifactErr     error
 
+	attachTaskID       int64
+	attachFindingID    int64
+	attachIntentID     int64
+	attachArtifactPath string
+	attachDescription  string
+	attachCalls        int
+	attachErr          error
+
 	progressTaskID int64
 	progressRaw    json.RawMessage
 	progressErr    error
@@ -162,6 +170,16 @@ func (f *fakeAuditDeps) WriteAuditArtifact(_ context.Context, taskID int64, relP
 		return "", f.artifactErr
 	}
 	return "audit/artifacts/" + relPath, nil
+}
+
+func (f *fakeAuditDeps) AttachAuditPOC(_ context.Context, taskID, findingID, intentID int64, artifactPath, description string) error {
+	f.attachCalls++
+	f.attachTaskID = taskID
+	f.attachFindingID = findingID
+	f.attachIntentID = intentID
+	f.attachArtifactPath = artifactPath
+	f.attachDescription = description
+	return f.attachErr
 }
 
 func (f *fakeAuditDeps) AuditProgress(_ context.Context, taskID int64) (json.RawMessage, error) {
@@ -1022,6 +1040,32 @@ func TestAuditArtifactWrite(t *testing.T) {
 	}
 }
 
+func TestAuditArtifactWriteBindsS10PoCToFinding(t *testing.T) {
+	fake := &fakeAuditDeps{}
+	ts := NewToolSet(nil, "code_worker")
+	ts.SetTaskID(31)
+	ts.SetOwnerNode(77)
+	ts.SetAuditDeps(fake)
+	input, _ := json.Marshal(map[string]any{
+		"path":        "poc/cwe89.py",
+		"content":     "print('not executed')",
+		"finding_id":  55,
+		"description": "SQL injection request template; not executed by the auditor",
+	})
+	result := callAuditTool(t, findAuditTool(t, ts.AuditWorkerTools(), "audit_artifact_write"), string(input))
+	if result.IsError {
+		t.Fatalf("artifact write failed: %s", result.Flatten())
+	}
+	if fake.artifactCalls != 1 || fake.artifactTaskID != 31 || fake.artifactPath != "poc/cwe89.py" {
+		t.Fatalf("artifact capture = %+v", fake)
+	}
+	if fake.attachCalls != 1 || fake.attachTaskID != 31 || fake.attachFindingID != 55 ||
+		fake.attachIntentID != 77 || fake.attachArtifactPath != "audit/artifacts/poc/cwe89.py" ||
+		fake.attachDescription != "SQL injection request template; not executed by the auditor" {
+		t.Fatalf("PoC attachment capture = %+v", fake)
+	}
+}
+
 func TestAuditArtifactPathValidation(t *testing.T) {
 	valid := map[string]string{
 		"poc/exploit.py":       "poc/exploit.py",
@@ -1196,6 +1240,14 @@ func TestAuditPromptBlocks(t *testing.T) {
 	if strings.Contains(workerPrompt, "中间产物输出规约") || strings.Contains(workerPrompt, "traffic_search") {
 		t.Fatalf("worker audit prompt leaked pentest blocks: %q", workerPrompt)
 	}
+	for _, want := range []string{
+		"S3 数据流", "S6 逻辑/合规", "S7 Odin 深析", "S8 设计验证",
+		"S9 深度放大", "S10 非执行 PoC", "finding_id", "executed=false",
+	} {
+		if !strings.Contains(workerPrompt, want) {
+			t.Fatalf("worker audit prompt lacks %q: %q", want, workerPrompt)
+		}
+	}
 
 	plannerPrompt := auditPlannerSystem("code_planner", "audit goal", "/data")
 	if !strings.Contains(plannerPrompt, "代码审计规划协议") || !strings.Contains(plannerPrompt, "ready_to_complete") {
@@ -1203,6 +1255,14 @@ func TestAuditPromptBlocks(t *testing.T) {
 	}
 	if strings.Contains(plannerPrompt, "中间产物输出规约") {
 		t.Fatalf("planner audit prompt leaked pentest artifact tail: %q", plannerPrompt)
+	}
+	for _, want := range []string{
+		"S3 数据流", "S6 逻辑/合规", "S7 Odin 深析", "S8 设计验证",
+		"S9 深度放大", "S10 非执行 PoC",
+	} {
+		if !strings.Contains(plannerPrompt, want) {
+			t.Fatalf("planner audit prompt lacks %q: %q", want, plannerPrompt)
+		}
 	}
 
 	// A user-edited DB prompt containing the old marker text MUST NOT suppress the
@@ -1279,7 +1339,10 @@ func TestBuiltinCodeAuditPromptSeeds(t *testing.T) {
 	if strings.TrimSpace(planner) == "" || strings.TrimSpace(worker) == "" {
 		t.Fatalf("missing code-audit prompt seeds: planner=%d worker=%d bytes", len(planner), len(worker))
 	}
-	for _, want := range []string{"audit_progress", "phases", "candidates", "gates", "硬底线", "TodoWrite", "ready_to_complete", "不读代码"} {
+	for _, want := range []string{
+		"audit_progress", "phases", "candidates", "gates", "Gate-H",
+		"记录新假设", "改变验证角度", "硬底线", "TodoWrite", "ready_to_complete", "不读代码",
+	} {
 		if !strings.Contains(planner, want) {
 			t.Errorf("code_planner seed lacks %q", want)
 		}

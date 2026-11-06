@@ -42,6 +42,23 @@ const (
 )
 
 const (
+	WorkerBackendBuiltin    = "builtin"
+	WorkerBackendCodex      = "codex"
+	WorkerBackendOpenCode   = "opencode"
+	WorkerBackendClaudeCode = "claudecode"
+	WorkerBackendCursor     = "cursor"
+	WorkerBackendPi         = "pi"
+	WorkerBackendCustom     = "custom"
+
+	WorkerModeStatic     = "static"
+	WorkerModePrivileged = "privileged"
+
+	DefaultWorkerTimeoutSeconds = 3600
+	MaxWorkerTimeoutSeconds     = 24 * 60 * 60
+	WorkerCwdWorkspace          = "{{workspace}}"
+)
+
+const (
 	minAuditRounds = 1
 	maxAuditRounds = 10
 )
@@ -63,8 +80,22 @@ type Config struct {
 	MaxRounds     int               `json:"max_rounds"`
 	Engines       map[string]string `json:"engines,omitempty"` // codegraph: required|auto|off; codeql,joern: auto|off
 	Budgets       map[string]any    `json:"budgets,omitempty"`
+	Worker        *WorkerConfig     `json:"worker,omitempty"`
 	IncludeTests  bool              `json:"include_tests,omitempty"`
 	IncludeVendor bool              `json:"include_vendor,omitempty"`
+}
+
+// WorkerConfig selects and parameterizes the task's worker runtime. External
+// CLI backends are argv-only; ARTEX never builds a shell string from them.
+type WorkerConfig struct {
+	Backend        string            `json:"backend,omitempty"`
+	Mode           string            `json:"mode,omitempty"`
+	Command        string            `json:"command,omitempty"`
+	Args           []string          `json:"args,omitempty"`
+	Cwd            string            `json:"cwd,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
+	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+	AutoConfirm    bool              `json:"auto_confirm,omitempty"`
 }
 
 // DefaultConfig returns the default audit configuration for a depth. An empty
@@ -114,6 +145,7 @@ func NormalizeConfig(c Config) Config {
 	c.CWEIDs = normalizeCWEIDs(c.CWEIDs)
 	c.Languages = normalizeLanguages(c.Languages)
 	c.Engines = normalizeEngines(c.Engines)
+	c.Worker = NormalizeWorkerConfig(c.Worker)
 	if c.Budgets != nil {
 		budgets := make(map[string]any, len(c.Budgets))
 		for name, value := range c.Budgets {
@@ -122,6 +154,46 @@ func NormalizeConfig(c Config) Config {
 		c.Budgets = budgets
 	}
 	return c
+}
+
+func NormalizeWorkerConfig(worker *WorkerConfig) *WorkerConfig {
+	if worker == nil {
+		return nil
+	}
+	out := *worker
+	out.Backend = strings.ToLower(strings.TrimSpace(out.Backend))
+	out.Mode = strings.ToLower(strings.TrimSpace(out.Mode))
+	out.Command = strings.TrimSpace(out.Command)
+	out.Args = normalizeWorkerArgs(out.Args)
+	out.Cwd = strings.TrimSpace(out.Cwd)
+	if out.Backend == "" {
+		out.Backend = WorkerBackendBuiltin
+	}
+	if out.Mode == "" {
+		out.Mode = WorkerModeStatic
+	}
+	if out.Cwd == "" {
+		out.Cwd = WorkerCwdWorkspace
+	}
+	if out.TimeoutSeconds == 0 {
+		out.TimeoutSeconds = DefaultWorkerTimeoutSeconds
+	}
+	if out.Env != nil {
+		env := make(map[string]string, len(out.Env))
+		for key, value := range out.Env {
+			env[strings.TrimSpace(key)] = value
+		}
+		out.Env = env
+	}
+	return &out
+}
+
+func normalizeWorkerArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, arg := range args {
+		out = append(out, strings.TrimSpace(arg))
+	}
+	return out
 }
 
 // ValidateConfig validates an audit config. The config is normalized first, so
@@ -200,7 +272,73 @@ func ValidateConfig(c Config, allowedLocalRoots []string) error {
 			return err
 		}
 	}
+	if err := ValidateWorkerConfig(c.Worker); err != nil {
+		return err
+	}
 	return nil
+}
+
+func ValidateWorkerConfig(worker *WorkerConfig) error {
+	if worker == nil {
+		return nil
+	}
+	switch worker.Backend {
+	case WorkerBackendBuiltin:
+		if worker.Command != "" || len(worker.Args) > 0 || len(worker.Env) > 0 {
+			return errors.New("builtin worker 不支持 command/args/env")
+		}
+	case WorkerBackendCodex, WorkerBackendOpenCode, WorkerBackendClaudeCode,
+		WorkerBackendCursor, WorkerBackendPi, WorkerBackendCustom:
+	default:
+		return fmt.Errorf("未知的 worker backend %q", worker.Backend)
+	}
+	switch worker.Mode {
+	case WorkerModeStatic, WorkerModePrivileged:
+	default:
+		return fmt.Errorf("无效的 worker mode %q（static|privileged）", worker.Mode)
+	}
+	if worker.Backend != WorkerBackendBuiltin {
+		if worker.Command == "" {
+			return errors.New("worker command 必填")
+		}
+		if len(worker.Args) == 0 {
+			return errors.New("worker args 必填")
+		}
+	}
+	for _, arg := range worker.Args {
+		if err := validateWorkerPlaceholder(arg); err != nil {
+			return err
+		}
+	}
+	if worker.TimeoutSeconds < 0 || worker.TimeoutSeconds > MaxWorkerTimeoutSeconds {
+		return fmt.Errorf("worker timeout_seconds 必须在 0..%d 之间", MaxWorkerTimeoutSeconds)
+	}
+	for key := range worker.Env {
+		if strings.TrimSpace(key) == "" {
+			return errors.New("worker env key 不能为空")
+		}
+	}
+	return nil
+}
+
+func validateWorkerPlaceholder(arg string) error {
+	for {
+		start := strings.Index(arg, "{{")
+		if start < 0 {
+			return nil
+		}
+		end := strings.Index(arg[start:], "}}")
+		if end < 0 {
+			return nil
+		}
+		name := strings.TrimSpace(arg[start+2 : start+end])
+		switch name {
+		case "task_id", "intent_id", "workspace", "snapshot_root", "prompt", "input_file", "output_file", "schema_file":
+		default:
+			return fmt.Errorf("不支持的 worker 占位符 {{%s}}", name)
+		}
+		arg = arg[start+end+2:]
+	}
 }
 
 func normalizeDepthValue(depth string) string {

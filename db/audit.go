@@ -134,6 +134,7 @@ type AuditDetectionIntent struct {
 	Scope            json.RawMessage `json:"scope"`
 	Constraints      json.RawMessage `json:"constraints"`
 	PreferredEngines json.RawMessage `json:"preferred_engines"`
+	Provenance       json.RawMessage `json:"provenance"`
 	Priority         int             `json:"priority"`
 	Status           string          `json:"status"`
 	Error            string          `json:"error"`
@@ -175,6 +176,16 @@ type AuditRound struct {
 	Focus         json.RawMessage `json:"focus"`
 	TokenUsage    json.RawMessage `json:"token_usage"`
 	CreatedAt     time.Time       `json:"created_at"`
+}
+
+// AuditRoundCounts summarizes one round's finding delta. NewFindings excludes
+// refuted and design_intent outcomes; TotalFindings is the task-wide
+// cumulative row count (all rounds, all verification states).
+type AuditRoundCounts struct {
+	NewFindings   int `json:"new_findings"`
+	NewConfirmed  int `json:"new_confirmed"`
+	NewCandidate  int `json:"new_candidate"`
+	TotalFindings int `json:"total_findings"`
 }
 
 // AuditEngineJob is one query prepared/validated/run by an analysis engine.
@@ -698,10 +709,10 @@ WHERE session_id=$1 AND round=$2 AND intent_id=$3
 
 func scanAuditDetectionIntent(sc interface{ Scan(...any) error }) (*AuditDetectionIntent, error) {
 	var i AuditDetectionIntent
-	var sources, sinks, sanitizers, propagators, scope, constraints, preferredEngines []byte
+	var sources, sinks, sanitizers, propagators, scope, constraints, preferredEngines, provenance []byte
 	if err := sc.Scan(&i.ID, &i.SessionID, &i.Round, &i.IntentKey, &i.Origin,
 		&i.Language, &i.CWE, &i.Title, &i.QueryKind, &sources, &sinks, &sanitizers,
-		&propagators, &scope, &constraints, &preferredEngines, &i.Priority, &i.Status,
+		&propagators, &scope, &constraints, &preferredEngines, &provenance, &i.Priority, &i.Status,
 		&i.Error, &i.CreatedAt, &i.UpdatedAt); err != nil {
 		return nil, err
 	}
@@ -712,6 +723,7 @@ func scanAuditDetectionIntent(sc interface{ Scan(...any) error }) (*AuditDetecti
 	i.Scope = cloneRawJSON(scope)
 	i.Constraints = cloneRawJSON(constraints)
 	i.PreferredEngines = cloneRawJSON(preferredEngines)
+	i.Provenance = cloneRawJSON(provenance)
 	return &i, nil
 }
 
@@ -727,9 +739,9 @@ func (d *DB) InsertAuditDetectionIntent(i AuditDetectionIntent) (*AuditDetection
 	row := d.QueryRow(`
 INSERT INTO audit_detection_intents(session_id, round, intent_key, origin, language, cwe,
     title, query_kind, sources, sinks, sanitizers, propagators, scope, constraints,
-    preferred_engines, priority, status, error)
+    preferred_engines, provenance, priority, status, error)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11::jsonb,$12::jsonb,
-    $13::jsonb,$14::jsonb,$15::jsonb,$16,$17,$18)
+    $13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17,$18,$19)
 ON CONFLICT (session_id, round, intent_key) DO UPDATE SET
     origin=EXCLUDED.origin,
     language=EXCLUDED.language,
@@ -743,18 +755,20 @@ ON CONFLICT (session_id, round, intent_key) DO UPDATE SET
     scope=EXCLUDED.scope,
     constraints=EXCLUDED.constraints,
     preferred_engines=EXCLUDED.preferred_engines,
+    provenance=EXCLUDED.provenance,
     priority=EXCLUDED.priority,
     status=EXCLUDED.status,
     error=EXCLUDED.error,
     updated_at=now()
 RETURNING id, session_id, round, intent_key, origin, language, cwe, title, query_kind,
-    sources, sinks, sanitizers, propagators, scope, constraints, preferred_engines,
+    sources, sinks, sanitizers, propagators, scope, constraints, preferred_engines, provenance,
     priority, status, error, created_at, updated_at`,
 		i.SessionID, i.Round, i.IntentKey, i.Origin, i.Language, i.CWE, i.Title,
 		i.QueryKind, auditJSONValue(i.Sources, "[]"), auditJSONValue(i.Sinks, "[]"),
 		auditJSONValue(i.Sanitizers, "[]"), auditJSONValue(i.Propagators, "[]"),
 		auditJSONValue(i.Scope, "{}"), auditJSONValue(i.Constraints, "{}"),
-		auditJSONValue(i.PreferredEngines, "[]"), i.Priority, i.Status, i.Error)
+		auditJSONValue(i.PreferredEngines, "[]"), auditJSONValue(i.Provenance, "{}"),
+		i.Priority, i.Status, i.Error)
 	return scanAuditDetectionIntent(row)
 }
 
@@ -762,7 +776,7 @@ RETURNING id, session_id, round, intent_key, origin, language, cwe, title, query
 func (d *DB) ListAuditDetectionIntents(sessionID int64, round int) ([]AuditDetectionIntent, error) {
 	rows, err := d.Query(`
 SELECT id, session_id, round, intent_key, origin, language, cwe, title, query_kind,
-       sources, sinks, sanitizers, propagators, scope, constraints, preferred_engines,
+       sources, sinks, sanitizers, propagators, scope, constraints, preferred_engines, provenance,
        priority, status, error, created_at, updated_at
 FROM audit_detection_intents WHERE session_id=$1 AND round=$2 ORDER BY id`, sessionID, round)
 	if err != nil {
@@ -918,6 +932,23 @@ FROM audit_rounds WHERE session_id=$1 ORDER BY round`, sessionID)
 		return nil, err
 	}
 	return out, nil
+}
+
+// CountAuditRoundFindings returns one round's finding delta plus the task's
+// cumulative total. NewFindings excludes refuted and design_intent outcomes;
+// NewCandidate includes legacy unverified rows so Gate-C cannot be fooled by
+// findings that never reached S5.
+func (d *DB) CountAuditRoundFindings(taskID int64, round int) (AuditRoundCounts, error) {
+	var out AuditRoundCounts
+	err := d.QueryRow(`
+SELECT
+  count(*) FILTER (WHERE audit_round=$2 AND lower(COALESCE(NULLIF(verification, ''), 'unverified')) NOT IN ('refuted', 'design_intent')),
+  count(*) FILTER (WHERE audit_round=$2 AND lower(COALESCE(NULLIF(verification, ''), 'unverified')) = 'confirmed'),
+  count(*) FILTER (WHERE audit_round=$2 AND lower(COALESCE(NULLIF(verification, ''), 'unverified')) IN ('candidate', 'unverified')),
+  count(*) FILTER (WHERE COALESCE(audit_round, 0) <= $2)
+FROM findings WHERE task_id=$1`, taskID, round).Scan(
+		&out.NewFindings, &out.NewConfirmed, &out.NewCandidate, &out.TotalFindings)
+	return out, err
 }
 
 func scanAuditEngineJob(sc interface{ Scan(...any) error }) (*AuditEngineJob, error) {

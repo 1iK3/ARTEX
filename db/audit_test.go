@@ -240,6 +240,7 @@ func TestAuditSchemaRoundTrip(t *testing.T) {
 		Sinks:            json.RawMessage(`[{"symbol":"Query"}]`),
 		Scope:            json.RawMessage(`{"path":"db"}`),
 		PreferredEngines: json.RawMessage(`["codegraph"]`),
+		Provenance:       json.RawMessage(`{"recognition_source":"sink_rule"}`),
 		Priority:         9,
 	})
 	if err != nil {
@@ -255,6 +256,7 @@ func TestAuditSchemaRoundTrip(t *testing.T) {
 	assertAuditJSON(t, intent.Scope, `{"path":"db"}`)
 	assertAuditJSON(t, intent.Constraints, `{}`)
 	assertAuditJSON(t, intent.PreferredEngines, `["codegraph"]`)
+	assertAuditJSON(t, intent.Provenance, `{"recognition_source":"sink_rule"}`)
 
 	intents, err := d.ListAuditDetectionIntents(session.ID, 1)
 	if err != nil {

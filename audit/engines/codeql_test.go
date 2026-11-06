@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -110,8 +111,8 @@ codeql/python-all@7.2.8: (library)`, "", nil
 	if !strings.Contains(additional, searchRoot) {
 		t.Errorf("SearchPath was not honored in additional packs: %q", additional)
 	}
-	if home, err := os.UserHomeDir(); err == nil && !strings.Contains(additional, filepath.Join(home, ".codeql", "packages")) {
-		t.Errorf("pack cache root missing from additional packs: %q", additional)
+	if home, err := os.UserHomeDir(); err == nil && strings.Contains(additional, filepath.Join(home, ".codeql", "packages")) {
+		t.Errorf("explicit SearchPath must not be mixed with the default pack cache: %q", additional)
 	}
 	if !capability.BuildModeNone {
 		t.Error("BuildModeNone = false")
@@ -297,6 +298,56 @@ func TestCodeQLValidateWritesQueryAndQlpacks(t *testing.T) {
 	}
 }
 
+func TestCodeQLValidateWritesDependencyLock(t *testing.T) {
+	workDir := t.TempDir()
+	packRoot := t.TempDir()
+	javaPack := writeCodeQLPackManifest(t, packRoot, "codeql/java-all", "9.2.0", map[string]string{
+		"codeql/util": "2.0.47",
+	})
+	utilPack := writeCodeQLPackManifest(t, packRoot, "codeql/util", "2.0.47", nil)
+	fake := &fakeExec{fn: func(ctx context.Context, name string, args []string, dir string) (string, string, error) {
+		if len(args) >= 2 && args[0] == "resolve" && args[1] == "packs" {
+			return "codeql/java-all@9.2.0: (library) " + javaPack, "", nil
+		}
+		return "", "", nil
+	}}
+	runner := &CodeQLRunner{Bin: "codeql", WorkDir: workDir, SearchPath: packRoot, execFn: fake.run}
+	q := mustRender(t, EngineCodeQL, testJavaTaintIntent())
+
+	if err := runner.Validate(context.Background(), q); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	lock, err := os.ReadFile(filepath.Join(workDir, "queries", "codeql", safeEngineID(q.ID), "codeql-pack.lock.yml"))
+	if err != nil {
+		t.Fatalf("dependency lock missing: %v", err)
+	}
+	text := string(lock)
+	if !strings.Contains(text, "lockVersion: 1.0.0") {
+		t.Errorf("dependency lock version missing: %s", text)
+	}
+	if !strings.Contains(text, "codeql/java-all:\n    version: 9.2.0") {
+		t.Errorf("language pack missing from lock: %s", text)
+	}
+	if !strings.Contains(text, "codeql/util:\n    version: 2.0.47") {
+		t.Errorf("transitive dependency missing from lock: %s", text)
+	}
+	call, ok := fake.find("codeql", "query", "compile")
+	if !ok {
+		t.Fatalf("query compile was not executed: %+v", fake.snapshot())
+	}
+	additional := ""
+	for _, arg := range call.Args {
+		if strings.HasPrefix(arg, "--additional-packs=") {
+			additional = arg
+		}
+	}
+	want := "--additional-packs=" + strings.Join([]string{filepath.Dir(javaPack), filepath.Dir(utilPack)}, string(os.PathListSeparator))
+	if additional != want {
+		t.Errorf("compile additional packs = %q, want %q", additional, want)
+	}
+}
+
 func TestCodeQLValidateFailures(t *testing.T) {
 	q := mustRender(t, EngineCodeQL, testJavaTaintIntent())
 
@@ -397,7 +448,7 @@ func TestCodeQLRunSARIFFixture(t *testing.T) {
 	if !ok {
 		t.Fatalf("analyze not called: %+v", fake.snapshot())
 	}
-	for _, want := range []string{"--format=sarif-latest", "--ram=4096", "--threads=0"} {
+	for _, want := range []string{"--format=sarif-latest", "--ram=4096", "--threads=2"} {
 		if !hasArg(analyze.Args, want) {
 			t.Errorf("analyze args missing %q: %v", want, analyze.Args)
 		}
@@ -602,7 +653,38 @@ func hasArg(args []string, want string) bool {
 	return false
 }
 
-const codeQLJavaPackOutput = "codeql/java-all@9.2.0: (library) C:/packs/qlpack.yml"
+const codeQLJavaPackOutput = "codeql/java-all@9.2.0: (library) testdata/codeql/java-all/9.2.0/qlpack.yml"
+
+func writeCodeQLPackManifest(t *testing.T, root, name, version string, dependencies map[string]string) string {
+	t.Helper()
+	relative := strings.Split(name, "/")
+	relative = append(relative, version, "qlpack.yml")
+	path := filepath.Join(append([]string{root}, relative...)...)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	out.WriteString("library: true\nname: " + name + "\nversion: " + version + "\n")
+	if len(dependencies) > 0 {
+		out.WriteString("dependencies:\n")
+		for _, dependency := range sortedMapKeys(dependencies) {
+			out.WriteString("  " + dependency + ": " + dependencies[dependency] + "\n")
+		}
+	}
+	if err := os.WriteFile(path, []byte(out.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func sortedMapKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
 
 func packAwareCodeQLExec(analyze func(ctx context.Context, args []string) (string, string, error)) *fakeExec {
 	return &fakeExec{fn: func(ctx context.Context, name string, args []string, dir string) (string, string, error) {

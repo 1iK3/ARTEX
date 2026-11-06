@@ -1393,6 +1393,9 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
 -- ===================== Code Audit =====================
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS task_mode TEXT NOT NULL DEFAULT 'pentest';
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS audit_config JSONB NOT NULL DEFAULT '{}';
+-- Task-level external worker runtime. This is intentionally independent of
+-- audit_config so pentest/CTF tasks can also use Codex/OpenCode/Claude Code.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS worker_config JSONB NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS idx_tasks_task_mode
   ON tasks(task_mode, created_at DESC) WHERE deleted_at IS NULL;
 
@@ -1401,6 +1404,7 @@ ALTER TABLE findings ADD COLUMN IF NOT EXISTS code_path TEXT NOT NULL DEFAULT ''
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS code_line INT NOT NULL DEFAULT 0;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS code_symbol TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS confidence REAL NOT NULL DEFAULT 0;
+ALTER TABLE findings ALTER COLUMN confidence TYPE DOUBLE PRECISION;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS verification TEXT NOT NULL DEFAULT 'unverified';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS dedupe_key TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS code_evidence JSONB NOT NULL DEFAULT '{}';
@@ -1499,6 +1503,7 @@ CREATE TABLE IF NOT EXISTS audit_detection_intents (
   scope JSONB NOT NULL DEFAULT '{}',
   constraints JSONB NOT NULL DEFAULT '{}',
   preferred_engines JSONB NOT NULL DEFAULT '[]',
+  provenance JSONB NOT NULL DEFAULT '{}',
   priority INT NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'planned',
   error TEXT NOT NULL DEFAULT '',
@@ -1506,6 +1511,9 @@ CREATE TABLE IF NOT EXISTS audit_detection_intents (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE(session_id, round, intent_key)
 );
+
+ALTER TABLE audit_detection_intents
+  ADD COLUMN IF NOT EXISTS provenance JSONB NOT NULL DEFAULT '{}';
 
 CREATE TABLE IF NOT EXISTS audit_hypotheses (
   id BIGSERIAL PRIMARY KEY,

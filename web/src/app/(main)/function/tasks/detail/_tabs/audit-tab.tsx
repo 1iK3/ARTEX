@@ -19,18 +19,27 @@ import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Progress } from "@/components/ui/progress";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
+import { auditCandidateRowKey, isAuditCandidateSelectable, selectedAuditFindingIds } from "@/lib/audit-candidate-batch";
+import { coverageGapRows, coverageGapSummary } from "@/lib/audit-coverage-visibility";
+import type { EngineVisibilityRow } from "@/lib/audit-engine-visibility";
+import { engineVisibilityIssues, engineVisibilityRows } from "@/lib/audit-engine-visibility";
 import type {
   AuditCandidate,
   AuditCapabilities,
   AuditCoverage,
   AuditEngineJob,
   AuditEngineState,
+  AuditFindingVerificationStatus,
   AuditGate,
   AuditHypothesis,
+  AuditIntentAnalysis,
   AuditPhase,
   AuditProgress,
   AuditRound,
@@ -396,6 +405,98 @@ function EngineCard({
   );
 }
 
+function EngineVisibilityCard({
+  rows,
+  issues,
+  analysis,
+}: {
+  rows: EngineVisibilityRow[];
+  issues: string[];
+  analysis?: AuditIntentAnalysis;
+}) {
+  const hasContent = rows.length > 0 || issues.length > 0 || Boolean(analysis);
+  if (!hasContent) return null;
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <CpuIcon className="size-4" /> 引擎查询与缺口
+        </CardTitle>
+        <CardDescription>最近一次作业、安全查询指纹与意图识别来源。</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        {rows.length > 0 ? (
+          <div className="overflow-x-auto rounded-md border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>引擎</TableHead>
+                  <TableHead>状态</TableHead>
+                  <TableHead>类型</TableHead>
+                  <TableHead>Intent</TableHead>
+                  <TableHead>查询指纹</TableHead>
+                  <TableHead className="text-right">结果</TableHead>
+                  <TableHead className="text-right">耗时</TableHead>
+                  <TableHead>错误</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {rows.map((row) => (
+                  <TableRow key={row.engine}>
+                    <TableCell className="font-medium">{row.engine}</TableCell>
+                    <TableCell>
+                      <StatusPill value={row.status} />
+                    </TableCell>
+                    <TableCell>{label(row.jobKind)}</TableCell>
+                    <TableCell>{row.intentId ?? "—"}</TableCell>
+                    <TableCell className="max-w-[10rem] truncate font-mono text-xs" title={row.queryHash}>
+                      {row.queryHash?.slice(0, 12) || "—"}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">{row.resultCount ?? 0}</TableCell>
+                    <TableCell className="text-right tabular-nums">{row.duration}</TableCell>
+                    <TableCell className="max-w-[16rem] truncate text-xs" title={row.error}>
+                      {row.error || "—"}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        ) : (
+          <p className="text-xs text-muted-foreground">暂无引擎作业记录。</p>
+        )}
+
+        {analysis && (
+          <div className="flex flex-wrap gap-1.5">
+            <Badge variant="outline">识别 {label(analysis.recognition_source)}</Badge>
+            {analysis.model && <Badge variant="outline">模型 {analysis.model}</Badge>}
+            {analysis.prompt_version && <Badge variant="outline">Prompt {analysis.prompt_version}</Badge>}
+            {analysis.raw_output_hash && (
+              <Badge variant="outline" title={analysis.raw_output_hash}>
+                Hash {analysis.raw_output_hash.slice(0, 12)}
+              </Badge>
+            )}
+            <Badge variant="outline">修复 {analysis.repair_attempts ?? 0}</Badge>
+            {analysis.fallback && <Badge variant="destructive">已回退</Badge>}
+          </div>
+        )}
+
+        {issues.length > 0 ? (
+          <ul className="flex flex-col gap-1">
+            {issues.map((issue) => (
+              <li key={issue} className="flex items-start gap-2 text-xs text-amber-700 dark:text-amber-300">
+                <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
+                <span>{issue}</span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-xs text-muted-foreground">暂无引擎缺口。</p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
 function CoverageRow({
   name,
   ratio,
@@ -479,10 +580,6 @@ function hypothesisSummary(hypotheses: AuditProgress["hypotheses"]): {
   return { counts: hypotheses, items: [] };
 }
 
-function candidateRowKey(candidate: AuditCandidate, index: number): string {
-  return String(candidate.id ?? `${candidate.phase ?? "candidate"}-${candidate.cwe ?? ""}-${index}`);
-}
-
 function roundGate(value?: string): React.ReactNode {
   if (!value) return <span className="text-muted-foreground">—</span>;
   const passed = ["pass", "passed", "true"].includes(value.toLowerCase());
@@ -542,6 +639,10 @@ export function CodeAuditTab({ taskId, onOpenReport }: { taskId: string; onOpenR
   const [capabilities, setCapabilities] = React.useState<AuditCapabilities | null>(null);
   const [capabilitiesLoading, setCapabilitiesLoading] = React.useState(true);
   const [downloading, setDownloading] = React.useState<"md" | "json" | null>(null);
+  const [selectedCandidateKeys, setSelectedCandidateKeys] = React.useState<Set<string>>(() => new Set());
+  const [batchVerification, setBatchVerification] = React.useState<AuditFindingVerificationStatus>("confirmed");
+  const [batchEvidence, setBatchEvidence] = React.useState("");
+  const [batchSubmitting, setBatchSubmitting] = React.useState(false);
 
   const loadCapabilities = React.useCallback(async () => {
     setCapabilitiesLoading(true);
@@ -647,9 +748,22 @@ export function CodeAuditTab({ taskId, onOpenReport }: { taskId: string; onOpenR
   const round = session?.round ?? progress.budget?.round ?? 0;
   const maxRounds = session?.max_rounds ?? progress.budget?.max_rounds ?? 0;
   const coverage = progress.coverage;
+  const coverageGaps = coverageGapRows(progress, 20);
+  const coverageGapInfo = coverageGapSummary(progress, 20);
   const rounds = progress.rounds ?? [];
   const gates = supplementRoundGates(normalizeGates(progress.gates), rounds);
   const candidates = progress.candidates ?? [];
+  const selectedFindingIds = selectedAuditFindingIds(candidates, selectedCandidateKeys);
+  const selectableCandidateKeys = candidates
+    .map((candidate, index) => (isAuditCandidateSelectable(candidate) ? auditCandidateRowKey(candidate, index) : null))
+    .filter((key): key is string => Boolean(key));
+  const selectedCandidateRowCount = selectableCandidateKeys.filter((key) => selectedCandidateKeys.has(key)).length;
+  let candidateHeaderChecked: boolean | "indeterminate" = false;
+  if (selectableCandidateKeys.length > 0 && selectedCandidateRowCount === selectableCandidateKeys.length) {
+    candidateHeaderChecked = true;
+  } else if (selectedCandidateRowCount > 0) {
+    candidateHeaderChecked = "indeterminate";
+  }
   const hypotheses = hypothesisSummary(progress.hypotheses);
   const findings = progress.findings;
   const byVerification = findings?.by_verification ?? {};
@@ -658,7 +772,53 @@ export function CodeAuditTab({ taskId, onOpenReport }: { taskId: string; onOpenR
   const codegraph = summarizeEngine(progress, "codegraph");
   const codeQL = summarizeEngine(progress, "codeql");
   const joern = summarizeEngine(progress, "joern");
+  const engineRows = engineVisibilityRows(progress);
+  const engineIssues = engineVisibilityIssues(progress);
+  const intentAnalysis = progress.engine_status?.intent_analysis;
   const reportReady = Boolean(progress.report_ready);
+
+  function toggleCandidateRow(key: string, checked: boolean) {
+    setSelectedCandidateKeys((previous) => {
+      const next = new Set(previous);
+      if (checked) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  }
+
+  function toggleAllCandidateRows(checked: boolean) {
+    setSelectedCandidateKeys((previous) => {
+      const next = new Set(previous);
+      for (const key of selectableCandidateKeys) {
+        if (checked) next.add(key);
+        else next.delete(key);
+      }
+      return next;
+    });
+  }
+
+  async function submitBatchVerification() {
+    if (selectedFindingIds.length === 0 || !batchEvidence.trim() || batchSubmitting) return;
+    setBatchSubmitting(true);
+    try {
+      const result = await api.auditFindingVerificationBatch(taskId, {
+        finding_ids: selectedFindingIds,
+        verification: batchVerification,
+        evidence: batchEvidence.trim(),
+      });
+      setSelectedCandidateKeys(new Set());
+      setBatchEvidence("");
+      const next = await api.auditProgress(taskId);
+      setProgress(next);
+      setError("");
+      setLastUpdated(new Date());
+      toast.success(`已更新 ${result.updated} 条候选验证结论`);
+    } catch (err) {
+      toast.error("批量验证失败：" + ((err as Error).message || "请稍后重试"));
+    } finally {
+      setBatchSubmitting(false);
+    }
+  }
 
   return (
     <div className="flex flex-col gap-4">
@@ -744,6 +904,8 @@ export function CodeAuditTab({ taskId, onOpenReport }: { taskId: string; onOpenR
           loading={capabilitiesLoading}
         />
       </div>
+
+      <EngineVisibilityCard rows={engineRows} issues={engineIssues} analysis={intentAnalysis} />
 
       <div className="grid gap-4 lg:grid-cols-2">
         <Card>
@@ -872,6 +1034,59 @@ export function CodeAuditTab({ taskId, onOpenReport }: { taskId: string; onOpenR
                 </Badge>
               ))}
             </div>
+            <div className="flex flex-col gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-medium">覆盖缺口钻取</span>
+                <span className="text-xs text-muted-foreground">
+                  {coverageGapInfo.shown}/{coverageGapInfo.total}
+                </span>
+              </div>
+              {coverageGapInfo.uncoveredCWEs.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {coverageGapInfo.uncoveredCWEs.map((cwe) => (
+                    <Badge key={cwe} variant="outline">
+                      未覆盖 {cwe}
+                    </Badge>
+                  ))}
+                </div>
+              )}
+              {coverageGaps.length > 0 ? (
+                <div className="overflow-x-auto rounded-md border">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>状态</TableHead>
+                        <TableHead>类型</TableHead>
+                        <TableHead>CWE</TableHead>
+                        <TableHead>位置</TableHead>
+                        <TableHead>原因</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {coverageGaps.map((row, index) => (
+                        <TableRow key={`${row.kind}-${row.path ?? row.sink_key ?? row.cwe ?? index}`}>
+                          <TableCell>
+                            <StatusPill value={row.status} />
+                          </TableCell>
+                          <TableCell>{label(row.kind)}</TableCell>
+                          <TableCell>{row.cwe || "—"}</TableCell>
+                          <TableCell className="max-w-[14rem] truncate text-xs">
+                            {row.path
+                              ? `${row.path}${row.line ? `:${row.line}` : ""}`
+                              : row.sink_key || row.module || "—"}
+                          </TableCell>
+                          <TableCell className="max-w-[16rem] truncate text-xs" title={row.reason}>
+                            {row.reason || "—"}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">暂无覆盖缺口。</p>
+              )}
+            </div>
           </CardContent>
         </Card>
 
@@ -946,37 +1161,100 @@ export function CodeAuditTab({ taskId, onOpenReport }: { taskId: string; onOpenR
           {candidates.length === 0 ? (
             <p className="py-6 text-center text-xs text-muted-foreground">暂无候选批次。</p>
           ) : (
-            <div className="overflow-x-auto rounded-md border">
-              <Table className="min-w-[40rem]">
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>阶段</TableHead>
-                    <TableHead>CWE</TableHead>
-                    <TableHead>模块</TableHead>
-                    <TableHead className="text-right">Sink</TableHead>
-                    <TableHead className="text-right">发现</TableHead>
-                    <TableHead className="text-right">优先级</TableHead>
-                    <TableHead>严重度</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {candidates.map((candidate, index) => (
-                    <TableRow key={candidateRowKey(candidate, index)}>
-                      <TableCell className="text-xs">{phaseLabel(candidate.phase)}</TableCell>
-                      <TableCell className="font-mono text-xs">{candidate.cwe || "—"}</TableCell>
-                      <TableCell className="max-w-48 truncate font-mono text-xs" title={candidate.module}>
-                        {candidate.module || candidate.language || "—"}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">{candidate.sink_keys?.length ?? 0}</TableCell>
-                      <TableCell className="text-right tabular-nums">{candidate.finding_ids?.length ?? 0}</TableCell>
-                      <TableCell className="text-right tabular-nums">{candidate.priority ?? "—"}</TableCell>
-                      <TableCell className="text-xs">
-                        {SEVERITY_LABELS[candidate.severity ?? ""] ?? label(candidate.severity)}
-                      </TableCell>
+            <div className="flex flex-col gap-3">
+              <div className="flex flex-wrap items-end gap-3 rounded-md border p-3">
+                <div className="flex w-40 flex-col gap-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">批量结论</span>
+                  <Select
+                    value={batchVerification}
+                    onValueChange={(value) => setBatchVerification(value as AuditFindingVerificationStatus)}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="confirmed">已确认</SelectItem>
+                      <SelectItem value="refuted">已反驳</SelectItem>
+                      <SelectItem value="design_intent">设计意图</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="flex min-w-72 flex-1 flex-col gap-1.5">
+                  <label htmlFor="audit-batch-evidence" className="text-xs font-medium text-muted-foreground">
+                    复核证据
+                  </label>
+                  <Textarea
+                    id="audit-batch-evidence"
+                    value={batchEvidence}
+                    onChange={(event) => setBatchEvidence(event.target.value)}
+                    maxLength={4000}
+                    rows={2}
+                    placeholder="填写人工复核依据，例如 source→sink、认证边界或设计意图说明"
+                    disabled={batchSubmitting}
+                  />
+                </div>
+                <Button
+                  size="sm"
+                  onClick={() => void submitBatchVerification()}
+                  disabled={selectedFindingIds.length === 0 || !batchEvidence.trim() || batchSubmitting}
+                >
+                  {batchSubmitting ? "提交中…" : `批量验证 ${selectedFindingIds.length} 条`}
+                </Button>
+              </div>
+              <div className="overflow-x-auto rounded-md border">
+                <Table className="min-w-[42rem]">
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-8">
+                        <Checkbox
+                          checked={candidateHeaderChecked}
+                          disabled={selectableCandidateKeys.length === 0}
+                          onCheckedChange={(checked) => toggleAllCandidateRows(checked === true)}
+                          aria-label="选择全部可验证候选批次"
+                        />
+                      </TableHead>
+                      <TableHead>阶段</TableHead>
+                      <TableHead>CWE</TableHead>
+                      <TableHead>模块</TableHead>
+                      <TableHead className="text-right">Sink</TableHead>
+                      <TableHead className="text-right">发现</TableHead>
+                      <TableHead className="text-right">优先级</TableHead>
+                      <TableHead>严重度</TableHead>
                     </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+                  </TableHeader>
+                  <TableBody>
+                    {candidates.map((candidate, index) => {
+                      const rowKey = auditCandidateRowKey(candidate, index);
+                      const selectable = isAuditCandidateSelectable(candidate);
+                      return (
+                        <TableRow key={rowKey}>
+                          <TableCell className="w-8">
+                            <Checkbox
+                              checked={selectedCandidateKeys.has(rowKey)}
+                              disabled={!selectable}
+                              onCheckedChange={(checked) => toggleCandidateRow(rowKey, checked === true)}
+                              aria-label={`选择候选批次 ${candidate.id ?? index + 1}`}
+                            />
+                          </TableCell>
+                          <TableCell className="text-xs">{phaseLabel(candidate.phase)}</TableCell>
+                          <TableCell className="font-mono text-xs">{candidate.cwe || "—"}</TableCell>
+                          <TableCell className="max-w-48 truncate font-mono text-xs" title={candidate.module}>
+                            {candidate.module || candidate.language || "—"}
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">{candidate.sink_keys?.length ?? 0}</TableCell>
+                          <TableCell className="text-right tabular-nums">
+                            {candidate.finding_ids?.length ?? 0}
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">{candidate.priority ?? "—"}</TableCell>
+                          <TableCell className="text-xs">
+                            {SEVERITY_LABELS[candidate.severity ?? ""] ?? label(candidate.severity)}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </div>
             </div>
           )}
         </CardContent>

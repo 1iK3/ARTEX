@@ -137,6 +137,29 @@ func TestAuditResolveTaskModeOptions(t *testing.T) {
 	})
 }
 
+func TestAuditResolveTaskModeOptionsWorkerRuntime(t *testing.T) {
+	got, err := resolveTaskModeOptions(db.TaskModeCodeAudit, &audit.Config{
+		SourceType: audit.SourceZip,
+		UploadID:   "u",
+		Worker: &audit.WorkerConfig{
+			Backend: audit.WorkerBackendCodex,
+			Mode:    audit.WorkerModePrivileged,
+			Command: "codex",
+			Args:    []string{"exec", "{{input_file}}"},
+		},
+	}, "g", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg audit.Config
+	if err := json.Unmarshal(got.AuditConfig, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Worker == nil || cfg.Worker.Backend != audit.WorkerBackendCodex || cfg.Worker.Mode != audit.WorkerModePrivileged {
+		t.Fatalf("worker config = %+v", cfg.Worker)
+	}
+}
+
 func TestAuditDecodeConfig(t *testing.T) {
 	for _, raw := range []json.RawMessage{nil, {}, json.RawMessage("null")} {
 		cfg, err := decodeAuditConfig(raw)

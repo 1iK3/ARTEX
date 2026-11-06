@@ -191,6 +191,77 @@ func TestAuditUpdateFindingVerification(t *testing.T) {
 	}
 }
 
+func TestAttachFindingPOC(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+	stamp := time.Now().UnixNano()
+	task, err := d.CreateTaskWithOptions(fmt.Sprintf("attach poc %d", stamp), "poc", TaskCreateOptions{
+		Mode: TaskModeCodeAudit, AuditConfig: json.RawMessage(`{"source_type":"zip","upload_id":"u"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.DeleteTask(task.ID) }()
+	store := d.Exploration(task.ExplorationID)
+	nodeID, err := store.AddNode(KindFinding, map[string]any{"summary": "confirmed"}, 9, "confirmed", "test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := json.RawMessage(`{"version":1,"cwe_id":"CWE-89","title":"t","severity":"high","verification":{"status":"confirmed"},"location":{"path":"a.go","line":1,"symbol":"f"}}`)
+	findingID, duplicate, err := d.AddCodeFinding(CodeFindingInput{
+		TaskID: task.ID, NodeID: nodeID, CWEID: "CWE-89", Title: "t", Severity: "high",
+		Summary: "confirmed", Evidence: "proof", Worker: "code_worker",
+		CodePath: "a.go", CodeLine: 1, CodeSymbol: "f", Confidence: 0.9,
+		Verification: "confirmed", CodeEvidence: evidence,
+	})
+	if err != nil || duplicate || findingID <= 0 {
+		t.Fatalf("AddCodeFinding id=%d duplicate=%v err=%v", findingID, duplicate, err)
+	}
+	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM findings WHERE id=$1`, findingID) })
+
+	if err := d.AttachFindingPOC(t.Context(), task.ID, findingID,
+		"audit/artifacts/poc/cwe89.py", "non-executing request template"); err != nil {
+		t.Fatal(err)
+	}
+	finding, err := d.GetFinding(findingID)
+	if err != nil || finding == nil {
+		t.Fatalf("GetFinding = %+v, %v", finding, err)
+	}
+	var stored struct {
+		POC audit.POCEvidence `json:"poc"`
+	}
+	if err := json.Unmarshal(finding.CodeEvidence, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.POC.Kind != "script" || stored.POC.ArtifactPath != "audit/artifacts/poc/cwe89.py" ||
+		stored.POC.Description != "non-executing request template" || stored.POC.Executed {
+		t.Fatalf("stored PoC = %+v", stored.POC)
+	}
+	node, err := store.GetNode(nodeID)
+	if err != nil || node == nil {
+		t.Fatalf("finding node = %+v, %v", node, err)
+	}
+	if err := json.Unmarshal(node.Payload, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.POC.ArtifactPath != "audit/artifacts/poc/cwe89.py" || stored.POC.Executed {
+		t.Fatalf("node PoC = %+v", stored.POC)
+	}
+
+	if err := d.AttachFindingPOC(t.Context(), task.ID+999999, findingID, "audit/artifacts/poc/x.py", "x"); !errors.Is(err, ErrFindingNotFound) {
+		t.Fatalf("wrong task error = %v, want ErrFindingNotFound", err)
+	}
+	if err := d.AttachFindingPOC(t.Context(), task.ID, findingID, "", "x"); err == nil {
+		t.Fatal("empty artifact path accepted")
+	}
+	if err := d.AttachFindingPOC(t.Context(), task.ID, findingID, "audit/artifacts/poc/x.py", ""); err == nil {
+		t.Fatal("empty description accepted")
+	}
+}
+
 func TestAuditCoverageAssignmentAndOwnedMarking(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
@@ -320,5 +391,50 @@ func TestAuditReleaseAuditCoverage(t *testing.T) {
 				t.Fatalf("%s ownership lost: %+v", row.SinkKey, row)
 			}
 		}
+	}
+}
+
+func TestAuditRoundFindingCounts(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+	stamp := time.Now().UnixNano()
+	task, err := d.CreateTaskWithOptions(fmt.Sprintf("round counts %d", stamp), "count", TaskCreateOptions{
+		Mode: TaskModeCodeAudit, AuditConfig: json.RawMessage(`{"source_type":"zip","upload_id":"u"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.DeleteTask(task.ID) }()
+	inputs := []CodeFindingInput{
+		{TaskID: task.ID, CWEID: "CWE-89", Title: "a", Severity: "high", Summary: "s", Evidence: "e", Worker: "code_worker",
+			CodePath: "a.go", CodeLine: 1, CodeSymbol: "f", Verification: "confirmed", AuditRound: 1},
+		{TaskID: task.ID, CWEID: "CWE-78", Title: "b", Severity: "high", Summary: "s", Evidence: "e", Worker: "code_worker",
+			CodePath: "b.go", CodeLine: 2, CodeSymbol: "g", Verification: "candidate", AuditRound: 1},
+		{TaskID: task.ID, CWEID: "CWE-79", Title: "c", Severity: "low", Summary: "s", Evidence: "e", Worker: "code_worker",
+			CodePath: "c.go", CodeLine: 3, CodeSymbol: "h", Verification: "refuted", AuditRound: 2},
+		{TaskID: task.ID, CWEID: "CWE-22", Title: "d", Severity: "medium", Summary: "s", Evidence: "e", Worker: "code_worker",
+			CodePath: "d.go", CodeLine: 4, CodeSymbol: "i", Verification: "candidate", AuditRound: 2},
+	}
+	for _, in := range inputs {
+		if id, dup, err := d.AddCodeFinding(in); err != nil || dup || id <= 0 {
+			t.Fatalf("AddCodeFinding(%s) id=%d dup=%v err=%v", in.Title, id, dup, err)
+		}
+	}
+	first, err := d.CountAuditRoundFindings(task.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != (AuditRoundCounts{NewFindings: 2, NewConfirmed: 1, NewCandidate: 1, TotalFindings: 2}) {
+		t.Fatalf("round 1 counts = %+v", first)
+	}
+	second, err := d.CountAuditRoundFindings(task.ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != (AuditRoundCounts{NewFindings: 1, NewConfirmed: 0, NewCandidate: 1, TotalFindings: 4}) {
+		t.Fatalf("round 2 counts = %+v", second)
 	}
 }

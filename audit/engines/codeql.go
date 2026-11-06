@@ -18,14 +18,20 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/audit"
+	"gopkg.in/yaml.v3"
 )
 
 const maxSARIFBytes = 64 << 20
 
 var (
-	codeQLPackLinePattern = regexp.MustCompile(`(?im)^\s*(codeql/[a-z0-9_.-]+)(?:@([^\s:]+))?\s*:`)
-	cweTagPattern         = regexp.MustCompile(`(?i)cwe[-_/]?0*([0-9]+)`)
+	codeQLPackLinePattern     = regexp.MustCompile(`(?im)^\s*(codeql/[a-z0-9_.-]+)(?:@([^\s:]+))?\s*:`)
+	codeQLPackLocationPattern = regexp.MustCompile(`(?im)^\s*(codeql/[a-z0-9_.-]+)@([^\s:]+):\s*\((?:library|query)\)\s+(.+?)\s*$`)
+	codeQLPackNamePattern     = regexp.MustCompile(`^codeql/[a-z0-9_.-]+$`)
+	codeQLPackVersionPattern  = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+)*(?:[-+][0-9A-Za-z.-]+)?$`)
+	cweTagPattern             = regexp.MustCompile(`(?i)cwe[-_/]?0*([0-9]+)`)
 )
+
+const CodeQLDefaultThreads = 2
 
 // CodeQLRunner is a CodeQL CLI adapter. It never runs a repository build: only
 // build-mode=none database creation is supported, unless the caller supplies a
@@ -36,12 +42,14 @@ type CodeQLRunner struct {
 	DBPath     string
 	SearchPath string
 	RAMMB      int
+	Threads    int
 	Timeout    time.Duration
 	execFn     ExecFunc
 
-	mu    sync.Mutex
-	dbs   map[string]string
-	packs map[string]string
+	mu        sync.Mutex
+	dbs       map[string]string
+	packs     map[string]string
+	packPaths map[string]string
 }
 
 // NewCodeQLRunner creates a runner. Empty bin defaults to "codeql".
@@ -105,6 +113,10 @@ func (r *CodeQLRunner) packRoots() []string {
 		for _, part := range strings.Split(searchPath, string(os.PathListSeparator)) {
 			add(part)
 		}
+		// An explicit search path is authoritative. Mixing it with the default
+		// cache can expose two versions of the same dependency pack and make
+		// CodeQL's resolver reject the query as ambiguous.
+		return roots
 	}
 	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
 		add(filepath.Join(home, ".codeql", "packages"))
@@ -112,8 +124,11 @@ func (r *CodeQLRunner) packRoots() []string {
 	return roots
 }
 
-func (r *CodeQLRunner) additionalPacksArg() string {
-	roots := r.packRoots()
+func (r *CodeQLRunner) discoveryPacksArg() string {
+	return additionalPacksArg(r.packRoots())
+}
+
+func additionalPacksArg(roots []string) string {
 	if len(roots) == 0 {
 		return ""
 	}
@@ -126,7 +141,7 @@ func (r *CodeQLRunner) discoverPacks(ctx context.Context) (map[string]string, er
 		return nil, err
 	}
 	args := []string{"resolve", "packs"}
-	if additional := r.additionalPacksArg(); additional != "" {
+	if additional := r.discoveryPacksArg(); additional != "" {
 		args = append(args, additional)
 	}
 	if searchPath := strings.TrimSpace(r.SearchPath); searchPath != "" {
@@ -147,8 +162,13 @@ func (r *CodeQLRunner) discoverPacks(ctx context.Context) (map[string]string, er
 	if len(packs) == 0 {
 		return nil, fmt.Errorf("%w: no CodeQL packs resolved", ErrCapability)
 	}
+	locations := parseCodeQLPackLocations(stdout)
+	if len(locations) == 0 {
+		locations = parseCodeQLPackLocations(stderr)
+	}
 	r.mu.Lock()
 	r.packs = packs
+	r.packPaths = locations
 	r.mu.Unlock()
 	return packs, nil
 }
@@ -157,6 +177,12 @@ func (r *CodeQLRunner) packVersion(packName string) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.packs[packName]
+}
+
+func (r *CodeQLRunner) packPath(packName string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.packPaths[packName]
 }
 
 func (r *CodeQLRunner) ensureLanguagePack(ctx context.Context, language string) (packName, version string, err error) {
@@ -512,13 +538,17 @@ func (r *CodeQLRunner) Validate(ctx context.Context, q QuerySpec) error {
 	if err != nil {
 		return err
 	}
-	queryFile, err := r.writeQueryFiles(q, packName, packVersion)
+	packPath := r.packPath(packName)
+	if packPath == "" {
+		return fmt.Errorf("%w: CodeQL pack %s location is not available", ErrCapability, packName)
+	}
+	queryFile, packDirs, err := r.writeQueryFiles(q, packName, packVersion, packPath)
 	if err != nil {
 		return err
 	}
 
 	args := []string{"query", "compile"}
-	if additional := r.additionalPacksArg(); additional != "" {
+	if additional := additionalPacksArg(packDirs); additional != "" {
 		args = append(args, additional)
 	}
 	if searchPath := strings.TrimSpace(r.SearchPath); searchPath != "" {
@@ -570,7 +600,11 @@ func (r *CodeQLRunner) Run(ctx context.Context, q QuerySpec) ([]EngineFinding, e
 	if err != nil {
 		return nil, err
 	}
-	queryFile, err := r.writeQueryFiles(q, packName, packVersion)
+	packPath := r.packPath(packName)
+	if packPath == "" {
+		return nil, fmt.Errorf("%w: CodeQL pack %s location is not available", ErrCapability, packName)
+	}
+	queryFile, packDirs, err := r.writeQueryFiles(q, packName, packVersion, packPath)
 	if err != nil {
 		return nil, err
 	}
@@ -592,8 +626,12 @@ func (r *CodeQLRunner) Run(ctx context.Context, q QuerySpec) ([]EngineFinding, e
 	if r.RAMMB > 0 {
 		args = append(args, "--ram="+strconv.Itoa(r.RAMMB))
 	}
-	args = append(args, "--threads=0")
-	if additional := r.additionalPacksArg(); additional != "" {
+	threads := r.Threads
+	if threads <= 0 {
+		threads = CodeQLDefaultThreads
+	}
+	args = append(args, "--threads="+strconv.Itoa(threads))
+	if additional := additionalPacksArg(packDirs); additional != "" {
 		args = append(args, additional)
 	}
 	if searchPath := strings.TrimSpace(r.SearchPath); searchPath != "" {
@@ -630,25 +668,181 @@ func (r *CodeQLRunner) Run(ctx context.Context, q QuerySpec) ([]EngineFinding, e
 	return findings, nil
 }
 
-func (r *CodeQLRunner) writeQueryFiles(q QuerySpec, packName, packVersion string) (string, error) {
+func (r *CodeQLRunner) writeQueryFiles(q QuerySpec, packName, packVersion, packPath string) (string, []string, error) {
 	queryID := safeEngineID(firstNonEmpty(q.ID, q.IntentID, q.Template, "query"))
 	directory, err := safeJoin(r.WorkDir, "queries", "codeql", queryID)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if err := ensureDir(directory); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	queryFile := filepath.Join(directory, "query.ql")
 	if err := os.WriteFile(queryFile, []byte(q.QueryText), 0o600); err != nil {
-		return "", fmt.Errorf("write CodeQL query: %w", err)
+		return "", nil, fmt.Errorf("write CodeQL query: %w", err)
 	}
 	qlpack := fmt.Sprintf("name: artex/generated-%s\nversion: 0.0.1\ndependencies:\n  %s: %q\n",
 		queryID, packName, packVersion)
 	if err := os.WriteFile(filepath.Join(directory, "qlpack.yml"), []byte(qlpack), 0o600); err != nil {
-		return "", fmt.Errorf("write CodeQL qlpack: %w", err)
+		return "", nil, fmt.Errorf("write CodeQL qlpack: %w", err)
 	}
-	return queryFile, nil
+	packDirs, err := r.writeCodeQLPackLock(directory, packPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: resolve CodeQL pack dependencies: %v", ErrCapability, err)
+	}
+	return queryFile, packDirs, nil
+}
+
+func (r *CodeQLRunner) writeCodeQLPackLock(directory, packPath string) ([]string, error) {
+	closure := newCodeQLPackClosure()
+	if err := r.collectCodeQLPackClosure(packPath, closure); err != nil {
+		return nil, err
+	}
+	names := closure.sortedNames()
+
+	var out strings.Builder
+	out.WriteString("---\nlockVersion: 1.0.0\ndependencies:\n")
+	for _, name := range names {
+		out.WriteString("  " + name + ":\n    version: " + closure.versions[name] + "\n")
+	}
+	out.WriteString("compiled: false\n")
+	if err := os.WriteFile(filepath.Join(directory, "codeql-pack.lock.yml"), []byte(out.String()), 0o600); err != nil {
+		return nil, err
+	}
+	return closure.packDirectories(), nil
+}
+
+type codeQLPackClosure struct {
+	versions map[string]string
+	paths    map[string]string
+}
+
+func newCodeQLPackClosure() *codeQLPackClosure {
+	return &codeQLPackClosure{versions: make(map[string]string), paths: make(map[string]string)}
+}
+
+func (c *codeQLPackClosure) sortedNames() []string {
+	names := make([]string, 0, len(c.versions))
+	for name := range c.versions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (c *codeQLPackClosure) packDirectories() []string {
+	names := c.sortedNames()
+	directories := make([]string, 0, len(names))
+	for _, name := range names {
+		directories = append(directories, filepath.Dir(c.paths[name]))
+	}
+	return directories
+}
+
+func (r *CodeQLRunner) collectCodeQLPackClosure(packPath string, closure *codeQLPackClosure) error {
+	manifest, err := readCodeQLPackManifest(packPath)
+	if err != nil {
+		return err
+	}
+	if existing, ok := closure.versions[manifest.Name]; ok {
+		if existing != manifest.Version {
+			return fmt.Errorf("conflicting versions for %s: %s and %s", manifest.Name, existing, manifest.Version)
+		}
+		return nil
+	}
+	closure.versions[manifest.Name] = manifest.Version
+	closure.paths[manifest.Name] = packPath
+
+	roots := r.codeQLPackLookupRoots(packPath)
+	dependencies := make([]string, 0, len(manifest.Dependencies))
+	for name := range manifest.Dependencies {
+		dependencies = append(dependencies, name)
+	}
+	sort.Strings(dependencies)
+	for _, name := range dependencies {
+		version, err := exactCodeQLPackVersion(manifest.Dependencies[name])
+		if err != nil {
+			return fmt.Errorf("dependency %s: %w", name, err)
+		}
+		if closure.versions[name] == version {
+			continue
+		}
+		dependencyPath := findCodeQLPack(roots, name, version)
+		if dependencyPath == "" {
+			return fmt.Errorf("pack %s@%s is not installed", name, version)
+		}
+		if err := r.collectCodeQLPackClosure(dependencyPath, closure); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *CodeQLRunner) codeQLPackLookupRoots(packPath string) []string {
+	roots := make([]string, 0, 3)
+	add := func(raw string) {
+		if raw == "" {
+			return
+		}
+		absolute, err := filepath.Abs(raw)
+		if err != nil {
+			absolute = filepath.Clean(raw)
+		}
+		for _, existing := range roots {
+			if strings.EqualFold(existing, absolute) {
+				return
+			}
+		}
+		roots = append(roots, absolute)
+	}
+
+	add(codeQLPackCacheRoot(packPath))
+	for _, root := range r.packRoots() {
+		add(root)
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		add(filepath.Join(home, ".codeql", "packages"))
+	}
+	return roots
+}
+
+type codeQLPackManifest struct {
+	Name         string            `yaml:"name"`
+	Version      string            `yaml:"version"`
+	Dependencies map[string]string `yaml:"dependencies"`
+}
+
+func readCodeQLPackManifest(path string) (codeQLPackManifest, error) {
+	var manifest codeQLPackManifest
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return manifest, err
+	}
+	if err := yaml.Unmarshal(data, &manifest); err != nil {
+		return manifest, fmt.Errorf("parse CodeQL pack manifest %s: %w", path, err)
+	}
+	if manifest.Name == "" || manifest.Version == "" {
+		return manifest, fmt.Errorf("CodeQL pack manifest %s has no name or version", path)
+	}
+	return manifest, nil
+}
+
+func codeQLPackCacheRoot(packPath string) string {
+	versionDir := filepath.Dir(packPath)
+	return filepath.Clean(filepath.Dir(filepath.Dir(filepath.Dir(versionDir))))
+}
+
+func findCodeQLPack(roots []string, name, version string) string {
+	if !codeQLPackNamePattern.MatchString(name) || !codeQLPackVersionPattern.MatchString(version) {
+		return ""
+	}
+	for _, root := range roots {
+		path := filepath.Join(root, filepath.FromSlash(name), version, "qlpack.yml")
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path
+		}
+	}
+	return ""
 }
 
 func paramString(params map[string]any, key string) string {
@@ -775,6 +969,33 @@ func parseCodeQLPackVersions(output string) map[string]string {
 		}
 	}
 	return out
+}
+
+func parseCodeQLPackLocations(output string) map[string]string {
+	out := make(map[string]string)
+	for _, match := range codeQLPackLocationPattern.FindAllStringSubmatch(output, -1) {
+		if len(match) < 4 {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(match[1]))
+		version := strings.TrimSpace(match[2])
+		path := strings.TrimSpace(match[3])
+		if version == "" || path == "" {
+			continue
+		}
+		if existing, ok := out[name]; !ok || existing == "" {
+			out[name] = path
+		}
+	}
+	return out
+}
+
+func exactCodeQLPackVersion(version string) (string, error) {
+	version = strings.TrimSpace(version)
+	if !codeQLPackVersionPattern.MatchString(version) {
+		return "", fmt.Errorf("version constraint %q is not an exact installed pack version", version)
+	}
+	return version, nil
 }
 
 func codeQLPackLanguage(language string) string {

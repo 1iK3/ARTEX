@@ -819,3 +819,96 @@ FOR UPDATE`, nodeID.Int64, taskID).Scan(&payloadRaw)
 		return err
 	})
 }
+
+// AttachFindingPOC binds a non-executing PoC artifact to a code-audit finding.
+// The method updates both the findings row and its exploration-node payload so
+// the graph view and report view stay in sync. Executed is always false: the
+// audit worker may write a PoC, but must never run target code.
+func (d *DB) AttachFindingPOC(ctx context.Context, taskID, findingID int64, artifactPath, description string) error {
+	if taskID <= 0 || findingID <= 0 {
+		return fmt.Errorf("task_id 和 finding_id 必须为正整数")
+	}
+	artifactPath = strings.TrimSpace(artifactPath)
+	if artifactPath == "" {
+		return errors.New("poc artifact_path 不能为空")
+	}
+	if normalized := audit.NormalizeCodePath(artifactPath); normalized == "" || normalized != artifactPath {
+		return fmt.Errorf("poc artifact_path %q 必须是规范化的相对路径", artifactPath)
+	}
+	description = strings.TrimSpace(description)
+	if description == "" {
+		return errors.New("poc description 不能为空")
+	}
+	poc := audit.POCEvidence{
+		Kind: "script", ArtifactPath: artifactPath,
+		Description: description, Executed: false,
+	}
+
+	return d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		var nodeID sql.NullInt64
+		var raw []byte
+		err := tx.QueryRowContext(ctx,
+			`SELECT node_id, code_evidence FROM findings WHERE id=$1 AND task_id=$2 FOR UPDATE`,
+			findingID, taskID).Scan(&nodeID, &raw)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrFindingNotFound
+		}
+		if err != nil {
+			return err
+		}
+
+		codeEvidence := map[string]any{}
+		if len(bytes.TrimSpace(raw)) > 0 {
+			if err := json.Unmarshal(raw, &codeEvidence); err != nil {
+				return fmt.Errorf("decode finding code_evidence: %w", err)
+			}
+			if codeEvidence == nil {
+				codeEvidence = map[string]any{}
+			}
+		}
+		codeEvidence["poc"] = poc
+		encoded, err := json.Marshal(codeEvidence)
+		if err != nil {
+			return fmt.Errorf("encode finding code_evidence: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE findings SET code_evidence=$3::jsonb WHERE id=$1 AND task_id=$2`,
+			findingID, taskID, string(jsonbClean(encoded))); err != nil {
+			return err
+		}
+
+		if !nodeID.Valid {
+			return nil
+		}
+		var payloadRaw []byte
+		err = tx.QueryRowContext(ctx, `
+SELECT payload FROM exploration_nodes
+WHERE id=$1
+  AND exploration_id=(SELECT exploration_id FROM tasks WHERE id=$2)
+FOR UPDATE`, nodeID.Int64, taskID).Scan(&payloadRaw)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: finding node %d 不属于任务 %d", ErrFindingNotFound, nodeID.Int64, taskID)
+		}
+		if err != nil {
+			return err
+		}
+		payload := map[string]any{}
+		if len(bytes.TrimSpace(payloadRaw)) > 0 {
+			if err := json.Unmarshal(payloadRaw, &payload); err != nil {
+				return fmt.Errorf("decode finding node payload: %w", err)
+			}
+			if payload == nil {
+				payload = map[string]any{}
+			}
+		}
+		payload["code_evidence"] = codeEvidence
+		nodeJSON, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("encode finding node payload: %w", err)
+		}
+		_, err = tx.ExecContext(ctx,
+			`UPDATE exploration_nodes SET payload=$2::jsonb WHERE id=$1`,
+			nodeID.Int64, string(jsonbClean(nodeJSON)))
+		return err
+	})
+}

@@ -719,8 +719,10 @@ func (s *Server) Handler() http.Handler {
 	// GET /api/tasks/{id} and only serve code_audit tasks.
 	mux.HandleFunc("GET /api/tasks/{id}/audit/progress", s.auditProgress)
 	mux.HandleFunc("GET /api/tasks/{id}/audit/report", s.auditReport)
+	mux.HandleFunc("POST /api/tasks/{id}/audit/findings/verification-batch", s.auditFindingVerificationBatch)
 	mux.HandleFunc("GET /api/tasks/{id}/audit/source/file", s.auditSourceFile)
 	mux.HandleFunc("GET /api/audit/capabilities", s.auditCapabilities)
+	mux.HandleFunc("GET /api/worker-backends", s.workerBackends)
 	// 任务级资产拦截/允许规则
 	mux.HandleFunc("GET /api/tasks/{id}/intercept-rules", s.taskInterceptListRules)
 	mux.HandleFunc("POST /api/tasks/{id}/intercept-rules", s.taskInterceptCreateRule)
@@ -1495,8 +1497,9 @@ type createTaskReq struct {
 	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
 	// TaskMode selects the execution pipeline: pentest (default) or code_audit.
 	// Audit is required for code_audit and rejected for pentest.
-	TaskMode string        `json:"task_mode,omitempty"`
-	Audit    *audit.Config `json:"audit,omitempty"`
+	TaskMode string              `json:"task_mode,omitempty"`
+	Audit    *audit.Config       `json:"audit,omitempty"`
+	Worker   *audit.WorkerConfig `json:"worker,omitempty"`
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
 }
@@ -1509,6 +1512,15 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(req.Description) == "" {
 		req.Description = "未命名任务"
+	}
+	if req.Worker != nil && req.Audit != nil && req.Audit.Worker != nil {
+		writeErr(w, 400, "worker 与 audit.worker 不能同时提供")
+		return
+	}
+	workerConfig, err := taskWorkerConfig(req.Worker)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
 	}
 	modeOptions, err := resolveTaskModeOptions(req.TaskMode, req.Audit, req.Goal, s.auditLocalRoots())
 	if err != nil {
@@ -1562,7 +1574,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
 		CoverageEnabled: req.CoverageEnabled,
 		InterceptRules:  interceptRules,
-		Mode:            modeOptions.Mode, AuditConfig: modeOptions.AuditConfig,
+		Mode:            modeOptions.Mode, AuditConfig: modeOptions.AuditConfig, WorkerConfig: workerConfig,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrTaskModeInvalid) {

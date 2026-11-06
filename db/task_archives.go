@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	TaskArchiveFormatVersion       = 3
+	TaskArchiveFormatVersion       = 4
 	TaskArchiveLegacyFormatVersion = 1
 	TaskArchiveLLMRecordsPath      = "database/llm_records.ndjson"
 )
@@ -46,8 +46,8 @@ var (
 	ErrTaskArchiveState          = errors.New("task archive state does not allow this operation")
 	ErrTaskArchiveDeleteBlocked  = errors.New("task archive is required by another archive")
 	ErrTaskArchiveFormatMismatch = errors.New("task archive format is not supported")
-	// ErrTaskArchiveUnsupported is temporary until M5 adds audit tables to the
-	// archive snapshot. Refusing is safer than silently dropping audit state.
+	// ErrTaskArchiveUnsupported is retained for API compatibility with older
+	// archives; code-audit tasks are now included in format v4 snapshots.
 	ErrTaskArchiveUnsupported = errors.New("task mode does not support archiving yet")
 )
 
@@ -242,9 +242,6 @@ WHERE t.id=$1 AND t.deleted_at IS NULL FOR UPDATE OF t`, taskID).Scan(
 	}
 	if err != nil {
 		return nil, err
-	}
-	if mode == TaskModeCodeAudit {
-		return nil, fmt.Errorf("%w: task %d", ErrTaskArchiveUnsupported, taskID)
 	}
 	if queued {
 		return nil, ErrTaskArchiveQueued
@@ -578,9 +575,6 @@ FROM tasks WHERE id=$1 AND deleted_at IS NULL`, taskID).Scan(&expID, &mode); err
 		}
 		return nil, err
 	}
-	if mode == TaskModeCodeAudit {
-		return nil, fmt.Errorf("%w: task %d", ErrTaskArchiveUnsupported, taskID)
-	}
 	tables := make(map[string]json.RawMessage)
 	queries := []struct {
 		name  string
@@ -609,6 +603,13 @@ FROM tasks WHERE id=$1 AND deleted_at IS NULL`, taskID).Scan(&expID, &mode); err
 		{"side_question_sessions", `SELECT * FROM side_question_sessions WHERE task_id=$1 ORDER BY session_key`, []any{taskID}},
 		{"side_question_requests", `SELECT r.* FROM side_question_requests r JOIN side_question_sessions s ON s.session_key=r.session_key WHERE s.task_id=$1 ORDER BY r.ordinal`, []any{taskID}},
 		{"assets", `SELECT asset.* FROM assets asset WHERE asset.id IN (` + archiveAssetIDsQuery() + `) ORDER BY asset.id`, []any{taskID, expID}},
+		{"audit_sessions", `SELECT * FROM audit_sessions WHERE task_id=$1 ORDER BY id`, []any{taskID}},
+		{"audit_phases", `SELECT * FROM audit_phases WHERE session_id IN (SELECT id FROM audit_sessions WHERE task_id=$1) ORDER BY id`, []any{taskID}},
+		{"audit_coverage", `SELECT * FROM audit_coverage WHERE session_id IN (SELECT id FROM audit_sessions WHERE task_id=$1) ORDER BY id`, []any{taskID}},
+		{"audit_detection_intents", `SELECT * FROM audit_detection_intents WHERE session_id IN (SELECT id FROM audit_sessions WHERE task_id=$1) ORDER BY id`, []any{taskID}},
+		{"audit_hypotheses", `SELECT * FROM audit_hypotheses WHERE session_id IN (SELECT id FROM audit_sessions WHERE task_id=$1) ORDER BY id`, []any{taskID}},
+		{"audit_rounds", `SELECT * FROM audit_rounds WHERE session_id IN (SELECT id FROM audit_sessions WHERE task_id=$1) ORDER BY id`, []any{taskID}},
+		{"audit_engine_jobs", `SELECT * FROM audit_engine_jobs WHERE session_id IN (SELECT id FROM audit_sessions WHERE task_id=$1) ORDER BY id`, []any{taskID}},
 	}
 	counts := make(map[string]int64, len(queries))
 	streamedTables := map[string]string{}

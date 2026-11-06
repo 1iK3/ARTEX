@@ -60,15 +60,16 @@ type Task struct {
 	CoverageEnabled      bool `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
 	// Mode selects the task execution pipeline (pentest|code_audit). It is frozen
 	// at creation. AuditConfig is the normalized audit.Config for code_audit tasks.
-	Mode        string                 `json:"task_mode"`
-	AuditConfig json.RawMessage        `json:"audit_config,omitempty"`
-	FirstRunAt  int64                  `json:"first_run_at,omitempty"`
-	DeadlineAt  int64                  `json:"deadline_at,omitempty"`
-	Store       *pgdb.ExplorationStore `json:"-"`
-	Guard       *guard.Guard           `json:"-"`
-	notify      chan struct{}
-	lifecycleMu sync.RWMutex
-	llmMu       sync.RWMutex
+	Mode         string                 `json:"task_mode"`
+	AuditConfig  json.RawMessage        `json:"audit_config,omitempty"`
+	WorkerConfig json.RawMessage        `json:"worker_config,omitempty"`
+	FirstRunAt   int64                  `json:"first_run_at,omitempty"`
+	DeadlineAt   int64                  `json:"deadline_at,omitempty"`
+	Store        *pgdb.ExplorationStore `json:"-"`
+	Guard        *guard.Guard           `json:"-"`
+	notify       chan struct{}
+	lifecycleMu  sync.RWMutex
+	llmMu        sync.RWMutex
 
 	// pendingTriggers accumulates the concrete changes (worker done / finding) that
 	// fired planning rounds since the last one consumed them. The debounce coalesces
@@ -857,7 +858,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		CompanyIDs:     append([]int64(nil), pt.CompanyIDs...),
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
 		CoverageEnabled: pt.CoverageEnabled,
-		Mode:            mode, AuditConfig: auditConfig,
+		Mode:            mode, AuditConfig: auditConfig, WorkerConfig: append(json.RawMessage(nil), pt.WorkerConfig...),
 		FirstRunAt: unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
 	}

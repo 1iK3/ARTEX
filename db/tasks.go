@@ -52,8 +52,9 @@ type Task struct {
 	CoverageEnabled bool `json:"coverage_enabled"`
 	// Mode selects the task execution pipeline. pentest is the existing behavior;
 	// code_audit drives the audit director (see db/audit.go).
-	Mode        string          `json:"task_mode"`
-	AuditConfig json.RawMessage `json:"audit_config,omitempty"`
+	Mode         string          `json:"task_mode"`
+	AuditConfig  json.RawMessage `json:"audit_config,omitempty"`
+	WorkerConfig json.RawMessage `json:"worker_config,omitempty"`
 }
 
 // TaskDeleteResult reports optional related-data cleanup performed in the same
@@ -178,8 +179,9 @@ type TaskCreateOptions struct {
 	// InterceptRules 是任务级资产拦截规则,创建时随任务在同一事务内写入 task_intercept_rules。
 	InterceptRules []TaskInterceptRuleInput
 	// Mode 是任务执行模式;空=pentest。AuditConfig 仅 code_audit 使用,空={}。
-	Mode        string
-	AuditConfig json.RawMessage
+	Mode         string
+	AuditConfig  json.RawMessage
+	WorkerConfig json.RawMessage
 }
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
@@ -200,6 +202,9 @@ func (d *DB) CreateTaskWithOptions(description, goal string, opts TaskCreateOpti
 	}
 	if len(opts.AuditConfig) == 0 {
 		opts.AuditConfig = json.RawMessage(`{}`)
+	}
+	if len(opts.WorkerConfig) == 0 {
+		opts.WorkerConfig = json.RawMessage(`{}`)
 	}
 	tx, err := d.Begin()
 	if err != nil {
@@ -256,12 +261,12 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		CompanyIDs:     append([]int64(nil), opts.CompanyIDs...),
 		TimeoutSeconds: opts.TimeoutSeconds, PlanHeartbeatSeconds: opts.PlanHeartbeatSeconds,
 		CoverageEnabled: coverageEnabled,
-		Mode:            opts.Mode, AuditConfig: cloneRawJSON(opts.AuditConfig),
+		Mode:            opts.Mode, AuditConfig: cloneRawJSON(opts.AuditConfig), WorkerConfig: cloneRawJSON(opts.WorkerConfig),
 	}
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, task_mode, audit_config)
-VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11::jsonb)
-RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.Mode, string(opts.AuditConfig)).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, task_mode, audit_config, worker_config)
+VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb)
+RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.Mode, string(opts.AuditConfig), string(opts.WorkerConfig)).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -377,15 +382,17 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, COALESCE(name,''), category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at, COALESCE(task_mode,'pentest'), COALESCE(audit_config,'{}'::jsonb)`
+description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at, COALESCE(task_mode,'pentest'), COALESCE(audit_config,'{}'::jsonb), COALESCE(worker_config,'{}'::jsonb)`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
 	var auditConfig []byte
-	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt, &t.Mode, &auditConfig); err != nil {
+	var workerConfig []byte
+	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt, &t.Mode, &auditConfig, &workerConfig); err != nil {
 		return nil, err
 	}
 	t.AuditConfig = cloneRawJSON(auditConfig)
+	t.WorkerConfig = cloneRawJSON(workerConfig)
 	t.Pinned = t.PinnedAt != nil
 	return &t, nil
 }

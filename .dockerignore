@@ -1,9 +1,16 @@
 .git
 **/node_modules
+**/__pycache__
+*.pyc
 web/.next
 web/out
 server/webui/dist
 /artex
+/artex-linux
+/artex.exe
+/exports/
+/docker/kali-audit/ctf-repos/
+/docker/kali-audit/agent-skills/
 data
 *.db
 transcripts

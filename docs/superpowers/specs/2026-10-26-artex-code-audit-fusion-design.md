@@ -296,7 +296,7 @@ paused / stopped / timeout 由现有 engine 生命周期控制
 ```json
 {
   "id": "intent-cwe89-java-01",
-  "origin": "sink_rule|user_goal|phase_requirement|engine_probe",
+  "origin": "sink_rule|user_goal|llm|phase_requirement|engine_probe",
   "language": "java",
   "cwe": "CWE-89",
   "title": "SQL injection taint in module user",
@@ -331,7 +331,7 @@ paused / stopped / timeout 由现有 engine 生命周期控制
 **来源：**
 
 1. **sink_rule**：从 Omni-Audit 的 `SinkDefinition`、Odin 规则和框架污点注册表确定性生成。按 `(language, cwe, module scope)` 分组；每个 CWE 至少一个意图。
-2. **user_goal**：从任务 `goal`/创建配置中的自由描述提取。LLM 只做意图抽取，输出上述 JSON；解析结果必须通过 schema 校验和引擎能力校验。失败则退化为“发现类”意图，由 S1/S2 阶段在获得仓库画像后重新生成。
+2. **user_goal / llm**：从任务 `goal` 提取。LLM 只做意图抽取，输出上述 JSON；解析结果必须通过严格 JSON schema、CWE/语言/scope/引擎白名单校验。失败则回退确定性 sink_rule 意图，并保留模型、提示词版本、原始输出哈希与 query gap 记录。P1-3 落地时持久化 origin 为 `llm`。
 3. **phase_requirement**：例如“认证/授权控制缺失”“CFG 可达性”“危险 API 组合”“日志/密钥/加密合规”。没有具体 sink 时使用 `control_flow`/`logic` 模板。
 4. **engine_probe**：引擎预置的快速探测（如硬编码密钥、危险 crypto API），用于在仓库画像前尽早产生 sink site。
 
@@ -366,7 +366,7 @@ QuerySpec 是意图到引擎查询的中间表示，所有引擎适配器只接�
 }
 ```
 
-- IR 哈希：`sha256(engine|language|query_kind|template|canonical(params))`，用于缓存和去重。
+- IR 哈希：`sha256(engine|engine_version|language|commit|query_kind|template|template_version|intent_ir_hash|canonical(params))`，用于缓存和去重。
 - 参数必须来自 DetectionIntent；模板渲染器负责转义和类型化，不拼接任意用户输入。
 - 引擎适配器拒绝不属于其 `Capabilities` 的 QuerySpec。
 
@@ -374,10 +374,10 @@ QuerySpec 是意图到引擎查询的中间表示，所有引擎适配器只接�
 
 1. **确定性识别**：扫描计划 CWE、注册表、框架污点对、阶段要求，生成 DetectionIntent。
 2. **自由目标识别（可选）**：
-   - 使用任务 LLM 链（`code_planner` runtime）调用一次固定提示词，输出 `{intents:[...]}`。
+   - 使用任务 LLM 链（`code-audit-intent` runtime）调用固定提示词，输出 `{intents:[...]}`。
    - 提示词包含：CWE 注册表摘要、语言、模块画像、引擎能力；要求只输出 schema 允许的字段。
-   - 结果经过 JSON schema、CWE 白名单、语言/引擎能力、scope 路径存在性校验；不合法则丢弃并按确定性结果继续。
-   - 记录模型、提示词版本、原始输出哈希，便于审计。
+   - 结果经过严格 JSON schema、CWE/语言/引擎/scope/pattern 校验，未知 `query_text`/`query`/`codeql`/`cpgql` 字段直接拒绝；不合法则按确定性结果回退。
+   - 记录模型、提示词版本、原始输出哈希、修复次数和识别来源；失败回退也保留最后一次可用的输出哈希，便于审计。
 3. **阶段内重识别**：S1/S2 得到模块/入口点后，重新生成 scope 更精确的意图；旧意图标记 `superseded`（不删除，保留审计链）。
 4. **意图与覆盖度绑定**：每个 DetectionIntent 必须映射到至少一个 `audit_coverage` 计划行（CWE/模块/入口点/引擎查询），否则不能执行。planner 通过 `add_intent` 带 `audit.sink_keys` 创建意图后，服务端必须执行 `ClaimAuditCoverage`：意图的 `audit.round` 必须等于 `audit_sessions.round`；每个 sink_key 必须存在于当前轮次且当前 `intent_id IS NULL`；未知、已拥有、部分认领全部拒绝，且认领更新必须一次原子完成。S4 检测意图不允许空 `sink_keys`（没有待扫描站点就不应派 S4 意图）；S1/S2/S3/S5+ 可以不带 sink_keys。
 5. **覆盖行回收**：意图进入终态（done/blocked/exhausted/stopped/deleted）时，服务端 `ReleaseAuditCoverage` 把仍为 `planned`（或 `missed`）的已分配行释放为未拥有，重新进入候选池；`scanned/candidate/benign/exempt` 等已完成裁决保留在该意图下。`done` 也要释放 worker 未回执的 planned 行。`audit_intent_complete` 允许分批回执，但未完成行必须在意图终止时可靠回收。
@@ -565,7 +565,7 @@ guards.p
 }
 ```
 - 按任务配置、语言、深度、磁盘/时间预算选择引擎。deep 默认三引擎全开（若可用）；standard 默认 CodeGraph + 可用引擎模板查询；quick 默认 CodeGraph。
-- 引擎准备和查询并发上限：准备 2 个并发，查询 2 个并发；避免占满 worker 和磁盘。
+- 引擎查询作业并发由预算 `engine_concurrency` 控制（默认 1，1–4），避免 CodeQL/Joern 同时争用 CPU、内存与磁盘；准备阶段保持串行。
 - 每个引擎任务受 `max_engine_seconds` 和任务总超时约束；超时记录 gap。
 - 引擎失败不影响其他引擎；Gate-Engine 单独统计。
 
@@ -1421,6 +1421,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
 - 引擎可用性、版本、准备状态、数据库/CPG 大小、查询成功率、最近失败。
 - 分页查询 `audit_engine_jobs`（查询文本可截断）。
 
+- P2-1（2026-10-28）：`audit_progress.engine_status` 已提供安全查询日志投影（最近作业、query hash、耗时、结果数、错误、意图识别 provenance 和缺口），任务详情页直接渲染；不返回查询文本或绝对路径。
 `GET /api/audit/capabilities`
 
 - 全局引擎探测结果、配置路径、安装提示、限制。
@@ -1429,6 +1430,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
 
 - 现有 `GET /api/exploration/findings` / `{id}` 增加 `cwe_id`、`verification`、`confidence`、`code_location`、顶层 `engines`；列表只返回这些紧凑字段，`GET /{id}` 详情额外返回完整 `code_evidence`。
 - 增加筛选参数：`cwe`、`verification`、`engine`（在现有 `FindingFilter` 上扩展）。
+- 新增 `POST /api/tasks/{id}/audit/findings/verification-batch`：任务内候选/未验证 finding 批量写入最终结论；结论限 `confirmed`/`refuted`/`design_intent`，证据必填，单次最多 200 条。
 - 现有 PATCH 状态、导出、复测保持兼容。
 
 ### 13.7 任务模板
@@ -1460,6 +1462,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
 - 新增“代码审计”页签（仅 code_audit 显示）：
   - 源信息卡片：源类型、脱敏地址、ref、commit、语言、大小、快照时间。
   - 引擎状态卡片：三引擎状态、版本、准备物大小、查询成功率、降级/缺口。
+  - 覆盖度缺口钻取：表格展示 planned/missed/exempt 行、位置、原因与未覆盖 CWE，不暴露绝对路径。
   - 阶段流水线 S0–S11：状态、轮次、必需项、门禁徽章、耗时。
   - 轮次历史表：新发现/累计/Gate-C/CWE/H/E/Coverage/决策。
   - 覆盖度：CWE 覆盖表、模块/入口点/站点覆盖率、缺失项与豁免原因（分页）。
@@ -1603,7 +1606,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
 | sink sites/CWE | 2000 | 是 |
 | 每轮意图 | 40 | 是 |
 | 引擎准备/查询 | 1800s | 是 |
-| CodeQL RAM | 4096 MB | 是 |
+| CodeQL RAM | 4096 MB | 是（512–32768 MB） |
+| CodeQL 线程 | 2 | 是（1–16） |
 | Joern 查询输出 | 10 MiB | 是 |
 | worker 工具结果 | 15K/结果，60K/循环 | 是 |
 | 任务 LLM token | 0（跟随任务超时） | 是 |
@@ -1810,35 +1814,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
 | 进度/报告/源码/能力 API | ✅ | `server/audit_api.go` |
 | 全栈 UI（创建/审计页签/证据/报告/Mock） | ✅ | `web/src/.../audit-tab.tsx`、`code-evidence.tsx` |
 | CodeGraph 适配 | ✅ | MCP `codegraph_explore` + CLI node/files/callers/callees/impact；live 测试通过 |
-| CodeQL 适配 | 🟡 | Java taint/sink 真实建库/编译/analyze/SARIF 通过；Python/JS/TS 模板受 packs 限制 |
-| Joern 适配 | 🟡 | Java parse/taint/sink 真实执行通过；其他语言模板已注册未逐一验证 |
+| CodeQL 适配 | ✅ | Java/Python/JS/TS taint/sink 真实建库/编译/analyze/SARIF 通过；Go/C/C++ 仅预构建 DB |
+| Joern 适配 | ✅ | Java/Python/JS/TS/Go/C/C++ parse/taint/sink 真实执行通过；sanitizer/path scope 已接入 |
 | DetectionIntent/QuerySpec/查询缓存/归一化 | ✅ | `audit/engines/*` |
-| 多轮聚焦补扫/收敛 | ❌ | M1 固定单轮；覆盖不足时可能 `done_with_gaps` |
-| Gate-C/H/Engine 完整驱动 | ❌/🟡 | 基础 Gate-Phase/Coverage/CWE/Evidence 已有；C/H/Engine 未完整接入轮次 |
-| S3/S5–S10 全链路 | ❌/🟡 | S5 有 finding_ids 候选/assigned findings；其余阶段多为跳过/预留 |
+| 多轮聚焦补扫/收敛 | ✅ | round 递增+台账前滚（终态保留/planned 重置）；Gate-C 连续 2 轮零新增收敛；audit_rounds 逐轮决策（2026-10-27） |
+| Gate-C/H/Engine 完整驱动 | ✅ | Gate-C 收敛、Gate-Engine 0.80 成功率阈值与 Gate-H findings→hypotheses/评分/pivot 纪律已接入（2026-10-28） |
+| S3/S5–S10 全链路 | ✅/🟡 | 服务端候选/派发/回执/完成链路与 worker 协议已打通；真实 LLM 深链质量仍需专项基准 |
 | LLM 自由目标意图识别 | ❌ | 当前仅 sink 规则/计划确定性生成 |
-| 审计任务归档/恢复 | ❌ | 当前显式拒绝 `code_audit` 归档 |
+| 审计任务归档/恢复 | ✅ | format v4 快照审计七表；归档→恢复→报告完整；恢复保持暂停且不启动 pentest 逻辑 |
 | 动态部署/PoC 执行 | ❌ | 明确非本轮目标 |
 
 ### 22.3 已真实验证
 
 - CodeQL 2.25.5：Java `build-mode=none` 建库、QL compile、analyze、SARIF；taint 1 条、sink 1 条。
-- Joern 4.0.535：Java `joern-parse`、CPGQL taint/sink；各 1 条。
+- CodeQL 2.27.3：Python/JavaScript/TypeScript `build-mode=none` 建库、QL compile、analyze、SARIF；每语言 taint/sink 各 1 条。
+- Joern 4.0.535：Java、Python、JavaScript、TypeScript、Go、C、C++ `joern-parse`、CPGQL taint/sink；各语言各查询 1 条。
 - CodeGraph：真实 MCP/CLI live 测试通过。
 - Web：`tsc --noEmit`、`build:static` 通过（31 路由）。
 - Go：`audit/engines`、`audit`、`agent` 审计测试、目标 `db`/`server` 测试、`go build ./...` 通过。
-- 未验证：PostgreSQL 端到端、真实 LLM 任务、归档恢复、非 Java 引擎模板、基准回归。
+- PostgreSQL 端到端、真实 LLM 三源任务、三语言基准回归、code_audit 归档/恢复已于 2026-10-27 完成；CodeQL Python/JS/TS 与 Joern 非 Java 于 2026-10-28 完成。
 
 ### 22.4 与设计基线的已知偏差
 
-1. **M1 单轮**：不递增 round，不做聚焦补扫；`max_rounds` 在这些路径下没有实际多轮效果。
-2. **阶段覆盖**：S0/S1/S2/S4/S5 有实际调度；S3/S6/S7/S8/S9/S10 多为跳过或仅预留工具/候选；S11 为 host 生成报告。
-3. **引擎范围**：CodeQL 只有 Java 模板真实验证；Joern 只有 Java 真实验证；Python/JS/TS CodeQL 因 packs 清单问题未注册。
+1. **多轮深度**：round 递增、Gate-C 收敛、Gate-Engine 成功率阈值与 Gate-H 评分/pivot 纪律均已实现；Gate-H 评分低于 70 仅警告，不单独阻断。
+2. **阶段覆盖**：S3/S5–S10 已有候选、协议、回执/完成与 S10 PoC 绑定；阶段内容质量依赖 code_worker 遵循提示词，尚需真实 LLM 深链基准验证；S11 为 host 生成报告。
+3. **引擎范围**：CodeQL Java/Python/JS/TS 模板已真实验证；Joern Java/Python/JS/TS/Go/C/C++ 已真实验证。CodeQL Go/C/C++ 仍仅支持预构建 DB。
 4. **意图识别**：没有自由文本 → DetectionIntent 的 LLM 解析；查询合成为模板主路径，没有 LLM 扩展 IR/查询体。
-5. **归档**：`code_audit` 任务被归档守卫拒绝；审计表未纳入 archive 格式。
-6. **数据库测试**：当前环境无 PostgreSQL，审计 DB/端到端测试全部 skip。
-7. **引擎错误/路径脱敏**：已做路径/凭据脱敏，但仍非完整 DLP；引擎 stderr 的极端自定义路径可能漏网。
-8. **源码路径**：本地/zip SourceRef 使用 basename+hash 脱敏；`audit_progress` 不暴露 snapshot_path。
+5. **引擎错误/路径脱敏**：已于 2026-10-29 加固；stderr 先截断再统一脱敏绝对路径、userinfo、Bearer、secret assignment、云 key 与私钥。
+6. **源码路径**：本地/zip SourceRef 使用 basename+hash 脱敏；`audit_progress` 不暴露 snapshot_path。
 
 ---
 
@@ -1870,6 +1873,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
 3. 修复所有 SQL/并发/幂等错误；补充审计 DB 测试不再 skip 的 CI 配置说明。
 4. 记录一次真实任务的活动流、报告、token、耗时；写入 `docs/audit-benchmarks/`（新建）。
 
+**状态**：✅ 已完成（2026-10-27）。三种输入源、报告、token/耗时与基准结果见 `docs/audit-benchmarks/2026-10-27-llm-e2e-and-benchmarks.md`。
+
 **涉及文件**：`db/audit.go`、`db/audit_test.go`、`db/audit_wiring_test.go`、`server/audit_director.go`、`server/audit_deps.go`、`server/audit_completion_db_test.go`、`server/audit_wiring_test.go`。
 
 **验收**
@@ -1879,6 +1884,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
 - 任务能终止为 done 或 done_with_gaps，不挂起。
 
 ### 23.2 P0-2：多轮聚焦补扫与收敛
+
+**状态**：✅ 已完成（2026-10-27，本地提交见 roadmap §7）。新增 `TestAuditDirectorAdvancesRoundOnGateFailure`、`TestAuditDirectorConvergesAfterTwoZeroRounds`、`TestAuditRoundFindingCounts`；审计测试 70→73 全绿。后续更新：Gate-Engine 已按 0.80 成功率阈值驱动；Gate-H 评分/pivot 细则已于 2026-10-28 补齐。
 
 **目标**：覆盖不足时自动补扫，而不是直接部分报告；支持 quick=1/standard=3/deep=5。
 
@@ -1915,6 +1922,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
 
 ### 23.3 P0-3：S3/S5–S10 全链路
 
+**状态**：✅ 已完成（2026-10-27）。新增 `TestBuildAuditCoverageCandidatesIncludesS3EntryPoints`、`TestAuditPlanCoverageRowsIncludesPlannedEntryPoints`、`TestAuditArtifactWriteBindsS10PoCToFinding`、`TestAttachFindingPOC`、`TestAuditDeepChainCompletesWithNonExecutingPoC`。S3 使用入口点覆盖候选，S5/S8/S10 使用 finding_ids，S6/S7/S9 有阶段候选与强制方法提示，S10 PoC 写入 artifact 并绑定 `code_evidence.poc.executed=false`。剩余：真实 LLM deep 任务的阶段质量抽样与误报/召回基准。
+
 **任务**
 
 1. **S3 数据流**：入口→sink 数据流、S0–S5 语义转换、清洗点；输出 facts/finding 候选。
@@ -1936,7 +1945,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
 
 ### 23.4 P1-1：CodeQL 模板扩展
 
-**现状**：Java taint/sink 已真实验证；Python/JS/TS 模板因 packs 清单/未安装未注册；Go/C/C++/Rust 无模板。
+**现状**：已完成（2026-10-28）。Java/Python/JS/TS taint/sink 已真实验证；Go/C/C++ 仅支持预构建 DB；Rust 无模板。
 
 **任务**
 
@@ -1954,7 +1963,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
 - 不支持的语言返回明确 capability gap，不生成无效 QL。
 - 查询 pack 安装/缓存步骤写入 `docs/code-audit-usage.md`。
 
-### 23.5 P1-2：Joern 非 Java 验证与加固
+**完成记录（2026-10-28）**
+
+- 使用 CodeQL 2.27.3、`codeql/python-all@7.2.8`、`codeql/javascript-all@2.10.4`。
+- Python/JavaScript/TypeScript 均通过真实 build-mode=none 建库、QL compile、analyze、SARIF，taint/sink 各命中 1 条。
+- 适配器从本地 `qlpack.yml` 解析传递依赖，为生成的查询包写 `codeql-pack.lock.yml`，并把精确版本目录传给 `--additional-packs`，避免缓存中多版本 pack 造成解析歧义；显式 `SearchPath` 不与默认缓存混合用于 pack 发现。
+
+### 23.5 P1-2：Joern 非 Java 验证与加固 ✅（2026-10-28）
 
 **任务**
 
@@ -1971,7 +1986,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
 - 每个声明支持的语言有 live 测试或明确 unsupported；报告披露。
 - 模板 sanitizer/scope 生效；Windows 启动路径已验证。
 
+**完成记录（2026-10-28）**
+
+- Java/Python/JavaScript/TypeScript/Go/C/C++ 均通过真实 `joern-parse` + taint/sink 查询；每语言每查询命中 1 条。
+- 修复 taint 模板重复主体与 Joern 4 path element sanitizer 匹配；Python/C/Go 数据流终点改为 `sinkCall.argument`，其余语言保持 sink call。
+- sanitizer 与 path/exclude scope 进入模板；Windows `.bat` 启动器与 JDK 17 真实验证。
+
 ### 23.6 P1-3：LLM 辅助意图识别与查询合成
+
+**状态**：✅ 已完成（2026-10-28）。`IntentAnalyst` 使用任务 LLM 链把自由目标转换为受限 `DetectionIntent` IR；严格 JSON 解析拒绝原生查询字段，初始输出后最多 2 次修复。失败时回退确定性 sink intents，`audit_sessions.engines` 与报告记录模型、提示词版本、raw hash、识别来源、修复次数和 query gap。查询缓存 key 已包含引擎版本、语言、commit、意图 IR hash 与模板版本。
 
 **任务**
 
@@ -1985,6 +2008,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
 
 **涉及文件**：`audit/engines/intent.go`/`query.go`、`server/audit_engines.go`、`agent/promptcatalog.go`、新 `audit/intent_analyst.go`。
 
+实际实现将 `IntentAnalyst` 放在 `audit/engines/intent_analyst.go`，避免 `audit` 根包与 `audit/engines` 形成导入环；未改 `agent/promptcatalog.go`，因为 P1-3 的固定提示词属于引擎层契约而非可编辑 planner prompt。
+
 **验收**
 
 - 用户输入“重点看文件上传和 SSRF”能生成对应 DetectionIntent/查询。
@@ -1992,6 +2017,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
 - 不允许 LLM 输出任意可执行 CPGQL（无沙箱时）。
 
 ### 23.7 P1-4：归档/恢复
+
+**状态**：✅ 已完成（2026-10-27）。`TaskArchiveFormatVersion` 升级到 4，快照/恢复覆盖 `audit_sessions`、`audit_phases`、`audit_coverage`、`audit_detection_intents`、`audit_hypotheses`、`audit_rounds`、`audit_engine_jobs`；数据层和服务层 round-trip 测试通过，恢复后报告可下载、任务保持暂停且不触发 pentest deadline/goals。
 
 **任务**
 
@@ -2011,7 +2038,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_repository
 ### 23.8 P2：UI/安全/性能/基准
 
 1. UI：引擎查询日志/缺口详情、覆盖度钻取、候选/验证批量操作、报告 Markdown 渲染/鉴权下载、源码查看器行高亮、模板编辑 mode/audit_config。
+   - ✅ 候选/验证批量操作（2026-10-29）：任务详情支持候选批次多选、结论选择、必填复核证据、批量提交与进度刷新；后端强制任务归属、candidate/unverified 状态、最终结论白名单、证据与数量上限。
+   - ✅ 报告渲染/下载与源码行高亮（2026-10-29）：报告页 Markdown 预览、复制和 fetch→blob 下载携带 Bearer；源码查看器支持起止行区间高亮、窗口裁剪与醒目的行号/边框标识。
+   - ✅ 模板管理 mode/audit_config 编辑（2026-10-29）：模板抽屉可选择渗透/代码审计模式，代码审计模板编辑 audit_config JSON；保存走后端校验/归一化，切换渗透模式清空配置，Mock 同步。
 2. 安全：报告/事件 DLP（私钥/云 key/JSON 转义 Windows 路径）、artifact 符号链接/ADS 复核、引擎 stderr 全量脱敏、CodeQL/Joern 资源/沙箱策略。
+   - ✅ 安全加固（2026-10-29）：引擎 stderr/错误在分类源头截断并统一脱敏绝对路径、userinfo、Bearer、secret assignment、云 key 与私钥；报告 DLP 沿用同一模式；artifact 符号链接/ADS 防护已复核；CodeQL 限定 no-build/RAM/线程/超时，Joern 限定模板/可选沙箱/超时/输出。
 3. 性能/成本：大仓库索引/DB/CPG 缓存、引擎并发/超时、token 预算、sink site 采样；把基准回归纳入可选 CI。
 4. 动态验证（独立项目，不在本 spec 范围）：一次性容器部署、构建、PoC 执行、MITM 流量取证、finding 绑定。
 

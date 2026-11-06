@@ -11,6 +11,12 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
+import {
+  type AuditSourceTarget,
+  auditHighlightRange,
+  auditSourceTarget,
+  isAuditHighlightedLine,
+} from "@/lib/audit-source-highlight";
 import type {
   AuditSourceFile,
   CodeEvidence,
@@ -68,18 +74,13 @@ function locationText(location?: CodeLocation | null): string {
   return `${location.path}${location.line ? `:${location.line}` : ""}${location.symbol ? ` · ${location.symbol}` : ""}`;
 }
 
-function sourceTarget(location?: CodeLocation | null): { path: string; line?: number } | null {
-  if (!location?.path) return null;
-  return { path: location.path, line: location.line };
-}
-
 function SourceLink({
   location,
   onOpen,
   label,
 }: {
   location?: CodeLocation | null;
-  onOpen: (path: string, line?: number) => void;
+  onOpen: (path: string, line?: number, endLine?: number) => void;
   label?: string;
 }) {
   if (!location?.path) return <span className="text-muted-foreground">—</span>;
@@ -88,7 +89,7 @@ function SourceLink({
       type="button"
       className="min-w-0 truncate text-left font-mono text-xs text-primary hover:underline"
       title={`查看源码 ${location.path}${location.line ? `:${location.line}` : ""}`}
-      onClick={() => onOpen(location.path as string, location.line)}
+      onClick={() => onOpen(location.path as string, location.line, location.end_line)}
     >
       {label ? `${label}：` : ""}
       {locationText(location)}
@@ -136,7 +137,7 @@ function SourceDialog({
   onClose,
 }: {
   taskId: string;
-  target: { path: string; line?: number } | null;
+  target: AuditSourceTarget | null;
   onClose: () => void;
 }) {
   const [file, setFile] = React.useState<AuditSourceFile | null>(null);
@@ -170,7 +171,10 @@ function SourceDialog({
   }, [target, taskId]);
 
   const lines = file?.content.split("\n") ?? [];
-  const targetLine = target?.line ?? 0;
+  const highlightRange = React.useMemo(
+    () => (file ? auditHighlightRange(target, { start_line: file.start_line, end_line: file.end_line }) : null),
+    [file, target],
+  );
 
   return (
     <Dialog open={target != null} onOpenChange={(open) => !open && onClose()}>
@@ -181,7 +185,9 @@ function SourceDialog({
           </DialogTitle>
           <DialogDescription>
             {file
-              ? `${file.language || "text"} · 第 ${file.start_line}-${file.end_line} 行 / 共 ${file.total_lines} 行（只读快照）`
+              ? `${file.language || "text"} · 第 ${file.start_line}-${file.end_line} 行 / 共 ${file.total_lines} 行（只读快照）${
+                  highlightRange ? ` · 高亮第 ${highlightRange.start}-${highlightRange.end} 行` : ""
+                }`
               : "正在读取任务源码快照…"}
           </DialogDescription>
         </DialogHeader>
@@ -199,13 +205,24 @@ function SourceDialog({
             <div className="min-w-max py-2 font-mono text-xs">
               {lines.map((line, index) => {
                 const lineNo = file.start_line + index;
-                const highlighted = targetLine > 0 && lineNo === targetLine;
+                const highlighted = isAuditHighlightedLine(lineNo, highlightRange);
                 return (
                   <div
                     key={lineNo}
-                    className={cn("flex min-h-5 px-2", highlighted && "bg-amber-500/20 dark:bg-amber-400/15")}
+                    className={cn(
+                      "border-l-2 px-2",
+                      highlighted
+                        ? "border-l-amber-500 bg-amber-500/25 ring-1 ring-inset ring-amber-500/40 dark:bg-amber-400/20"
+                        : "border-l-transparent",
+                      "flex min-h-5",
+                    )}
                   >
-                    <span className="sticky left-0 w-12 shrink-0 select-none bg-inherit pr-3 text-right text-muted-foreground">
+                    <span
+                      className={cn(
+                        "sticky left-0 w-12 shrink-0 select-none bg-inherit pr-3 text-right",
+                        highlighted ? "font-semibold text-amber-700 dark:text-amber-300" : "text-muted-foreground",
+                      )}
+                    >
                       {lineNo}
                     </span>
                     <span className="whitespace-pre pr-6">{line || " "}</span>
@@ -226,12 +243,12 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
 
 export function CodeEvidenceSection({ finding, contextTaskId }: { finding: Finding; contextTaskId?: string }) {
   const evidence = React.useMemo(() => parseEvidence(finding), [finding]);
-  const [target, setTarget] = React.useState<{ path: string; line?: number } | null>(null);
+  const [target, setTarget] = React.useState<AuditSourceTarget | null>(null);
   const taskId = finding.task_id ?? contextTaskId ?? "";
   const openSource = React.useCallback(
-    (path: string, line?: number) => {
+    (path: string, line?: number, endLine?: number) => {
       if (!taskId) return;
-      setTarget({ path, line });
+      setTarget({ path, line, endLine });
     },
     [taskId],
   );
@@ -262,7 +279,7 @@ export function CodeEvidenceSection({ finding, contextTaskId }: { finding: Findi
   const reachability = evidence?.reachability;
   const poco = evidence?.poc;
   const analysis = evidence?.analysis;
-  const targetLocation = sourceTarget(location);
+  const targetLocation = auditSourceTarget(location);
 
   return (
     <div className="flex flex-col gap-4">
@@ -302,7 +319,7 @@ export function CodeEvidenceSection({ finding, contextTaskId }: { finding: Findi
                   size="sm"
                   variant="outline"
                   className="h-6 px-2 text-xs"
-                  onClick={() => openSource(targetLocation.path, targetLocation.line)}
+                  onClick={() => openSource(targetLocation.path, targetLocation.line, targetLocation.endLine)}
                 >
                   <SearchIcon className="size-3" /> 查看源码
                 </Button>

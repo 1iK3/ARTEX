@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+const (
+	DefaultEngineConcurrency = 1
+	MaxEngineConcurrency     = 4
+)
+
 // Manager owns the engine registry, probe capabilities, prepared artifacts,
 // and the rendered-query cache. It is safe for concurrent use; engine calls are
 // made outside the manager lock.
@@ -22,6 +27,8 @@ type Manager struct {
 	capabilities map[string]Capability
 	prepared     map[string]preparedState
 	cache        *QueryCache
+	sourceCommit string
+	concurrency  int
 }
 
 type preparedState struct {
@@ -45,11 +52,24 @@ func NewManagerWithCache(cache *QueryCache, engines ...Engine) *Manager {
 		capabilities: make(map[string]Capability),
 		prepared:     make(map[string]preparedState),
 		cache:        cache,
+		concurrency:  DefaultEngineConcurrency,
 	}
 	for _, engine := range engines {
 		_ = manager.Register(engine)
 	}
 	return manager
+}
+
+// SetEngineConcurrency bounds the number of intent/engine jobs that may call
+// into adapters at the same time. Values below one restore the safe default;
+// values above MaxEngineConcurrency are capped.
+func (m *Manager) SetEngineConcurrency(limit int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.concurrency = normalizeEngineConcurrency(limit)
 }
 
 // Register adds or replaces one engine. Registering an engine clears its
@@ -241,6 +261,7 @@ func (m *Manager) PrepareAll(ctx context.Context, src SourceRef, langs []string,
 			failures = append(failures, fmt.Errorf("%s prepare: %w", name, redactEngineError(err)))
 		}
 	}
+	m.setSourceCommit(src.Commit)
 	return result, failures
 }
 
@@ -262,76 +283,147 @@ func (m *Manager) RunIntents(ctx context.Context, intents []DetectionIntent, eng
 	}
 	m.mu.Unlock()
 
-	findings := make([]EngineFinding, 0)
-	results := make([]JobResult, 0)
+	type intentJob struct {
+		intent DetectionIntent
+		engine string
+	}
+	jobs := make([]intentJob, 0)
 	for _, intent := range intents {
 		selected := selectEngines(intent, engineNames, engines)
 		for _, name := range selected {
-			started := time.Now()
-			result := JobResult{Engine: name, IntentID: intent.ID}
-			engine, registered := engines[name]
-			if !registered {
-				finishJob(&results, result, started, JobStatusSkipped, "engine not registered")
-				continue
-			}
-			capability := m.ensureCapability(ctx, name, engine)
-			if !capability.Available {
-				reason := firstNonEmpty(capability.Reason, "unavailable")
-				finishJob(&results, result, started, JobStatusSkipped, "engine unavailable: "+reason)
-				continue
-			}
-			if !languageSupported(capability.Languages, intent.Language) {
-				finishJob(&results, result, started, JobStatusSkipped,
-					"language not supported: "+intent.Language)
-				continue
-			}
-			artifactPath := ""
-			if name != EngineCodeGraph {
-				prepared, ok := m.preparedFor(name)
-				if ok {
-					path, reason, blocked := preparedArtifact(prepared.prepared, intent.Language)
-					if blocked {
-						finishJob(&results, result, started, JobStatusSkipped, reason)
-						continue
-					}
-					artifactPath = path
-				}
-			}
-
-			query, err := m.renderCached(intent, name)
-			if err != nil {
-				status := JobStatusFailed
-				if errors.Is(err, ErrUnsupported) {
-					status = JobStatusSkipped
-				}
-				finishJob(&results, result, started, status, err.Error())
-				continue
-			}
-			result.QueryHash = QueryCacheKey(query)
-			if err := ValidateQuerySpec(query); err != nil {
-				finishJob(&results, result, started, JobStatusFailed, err.Error())
-				continue
-			}
-			if artifactPath != "" {
-				query.ArtifactPath = artifactPath
-			}
-			if err := engine.Validate(ctx, query); err != nil {
-				finishJob(&results, result, started, JobStatusFailed, err.Error())
-				continue
-			}
-
-			engineFindings, runErr := engine.Run(ctx, query)
-			for _, finding := range engineFindings {
-				findings = append(findings, annotateFinding(finding, query, intent))
-			}
-			if runErr != nil {
-				finishJob(&results, result, started, JobStatusFailed, runErr.Error())
-				continue
-			}
-			finishJob(&results, result, started, JobStatusDone, "")
+			jobs = append(jobs, intentJob{intent: intent, engine: name})
 		}
 	}
+
+	capabilities := make(map[string]Capability, len(engines))
+	for _, job := range jobs {
+		if _, exists := capabilities[job.engine]; exists {
+			continue
+		}
+		engine, registered := engines[job.engine]
+		if !registered {
+			capabilities[job.engine] = Capability{Available: false}
+			continue
+		}
+		capabilities[job.engine] = m.ensureCapability(ctx, job.engine, engine)
+	}
+
+	findings := make([]EngineFinding, 0)
+	results := make([]JobResult, len(jobs))
+	if len(jobs) == 0 {
+		return Normalize(findings), results
+	}
+
+	var findingsMu sync.Mutex
+	var workers sync.WaitGroup
+	workerCount := m.engineConcurrency()
+	if workerCount > len(jobs) {
+		workerCount = len(jobs)
+	}
+	work := make(chan int)
+	for worker := 0; worker < workerCount; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for index := range work {
+				job := jobs[index]
+				intent := job.intent
+				name := job.engine
+				started := time.Now()
+				result := JobResult{Engine: name, IntentID: intent.ID}
+				engine, registered := engines[name]
+				if !registered {
+					results[index] = completeJob(result, started, JobStatusSkipped, "engine not registered")
+					continue
+				}
+				capability := capabilities[name]
+				if !capability.Available {
+					reason := firstNonEmpty(capability.Reason, "unavailable")
+					results[index] = completeJob(result, started, JobStatusSkipped, "engine unavailable: "+reason)
+					continue
+				}
+				if !languageSupported(capability.Languages, intent.Language) {
+					results[index] = completeJob(result, started, JobStatusSkipped,
+						"language not supported: "+intent.Language)
+					continue
+				}
+				artifactPath := ""
+				if name != EngineCodeGraph {
+					prepared, ok := m.preparedFor(name)
+					if ok {
+						path, reason, blocked := preparedArtifact(prepared.prepared, intent.Language)
+						if blocked {
+							results[index] = completeJob(result, started, JobStatusSkipped, reason)
+							continue
+						}
+						artifactPath = path
+					}
+				}
+
+				query, err := m.renderCached(intent, name, capability.Version, m.currentSourceCommit())
+				if err != nil {
+					status := JobStatusFailed
+					if errors.Is(err, ErrUnsupported) {
+						status = JobStatusSkipped
+					}
+					results[index] = completeJob(result, started, status, err.Error())
+					continue
+				}
+				result.QueryHash = QueryCacheKey(query)
+				if err := ValidateQuerySpec(query); err != nil {
+					results[index] = completeJob(result, started, JobStatusFailed, err.Error())
+					continue
+				}
+				if artifactPath != "" {
+					query.ArtifactPath = artifactPath
+				}
+				if err := engine.Validate(ctx, query); err != nil {
+					results[index] = completeJob(result, started, JobStatusFailed, err.Error())
+					continue
+				}
+
+				engineFindings, runErr := engine.Run(ctx, query)
+				findingsMu.Lock()
+				for _, finding := range engineFindings {
+					findings = append(findings, annotateFinding(finding, query, intent))
+				}
+				findingsMu.Unlock()
+				if runErr != nil {
+					results[index] = completeJob(result, started, JobStatusFailed, runErr.Error())
+					continue
+				}
+				results[index] = completeJob(result, started, JobStatusDone, "")
+			}
+		}()
+	}
+	for index := range jobs {
+		work <- index
+	}
+	close(work)
+	workers.Wait()
 	return Normalize(findings), results
+}
+
+func (m *Manager) engineConcurrency() int {
+	if m == nil {
+		return DefaultEngineConcurrency
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.concurrency <= 0 {
+		return DefaultEngineConcurrency
+	}
+	return m.concurrency
+}
+
+func normalizeEngineConcurrency(limit int) int {
+	if limit <= 0 {
+		return DefaultEngineConcurrency
+	}
+	if limit > MaxEngineConcurrency {
+		return MaxEngineConcurrency
+	}
+	return limit
 }
 
 func (m *Manager) ensureCapability(ctx context.Context, name string, engine Engine) Capability {
@@ -386,14 +478,14 @@ func (m *Manager) preparedFor(name string) (preparedState, bool) {
 	return state, true
 }
 
-func (m *Manager) renderCached(intent DetectionIntent, engine string) (QuerySpec, error) {
+func (m *Manager) renderCached(intent DetectionIntent, engine, engineVersion, commit string) (QuerySpec, error) {
 	normalizedEngine := normalizeEngineName(engine)
 	if normalizedEngine == "" {
 		return QuerySpec{}, fmt.Errorf("%w: unknown engine %q", ErrUnsupported, engine)
 	}
 	// Render first: a taint intent may legitimately fall back to a sink-only
 	// template, and the effective QueryKind is part of the cache key.
-	query, err := Render(normalizedEngine, intent)
+	query, err := RenderForSource(normalizedEngine, intent, engineVersion, commit)
 	if err != nil {
 		return QuerySpec{}, err
 	}
@@ -406,6 +498,24 @@ func (m *Manager) renderCached(intent DetectionIntent, engine string) (QuerySpec
 		m.cache.Put(key, query)
 	}
 	return query, nil
+}
+
+func (m *Manager) setSourceCommit(commit string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.sourceCommit = strings.TrimSpace(commit)
+	m.mu.Unlock()
+}
+
+func (m *Manager) currentSourceCommit() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sourceCommit
 }
 
 func selectEngines(intent DetectionIntent, requested []string, engines map[string]Engine) []string {
@@ -490,10 +600,14 @@ func annotateFinding(finding EngineFinding, query QuerySpec, intent DetectionInt
 }
 
 func finishJob(results *[]JobResult, result JobResult, started time.Time, status, message string) {
+	*results = append(*results, completeJob(result, started, status, message))
+}
+
+func completeJob(result JobResult, started time.Time, status, message string) JobResult {
 	result.Status = status
 	result.Error = RedactEngineText(message)
 	result.Duration = time.Since(started)
-	*results = append(*results, result)
+	return result
 }
 
 func prepareFingerprint(src SourceRef, languages []string, opts PrepareOptions) string {

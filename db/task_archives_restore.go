@@ -48,9 +48,6 @@ FROM task_archives archive JOIN tasks task ON task.id=archive.task_id
 WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID, &state, &mode); err != nil {
 		return err
 	}
-	if mode == TaskModeCodeAudit {
-		return fmt.Errorf("%w: task %d", ErrTaskArchiveUnsupported, taskID)
-	}
 	if state != Archiving || taskID != snapshot.TaskID || expID != snapshot.ExplorationID {
 		return fmt.Errorf("%w: archive snapshot identity/state mismatch", ErrTaskArchiveState)
 	}
@@ -83,6 +80,9 @@ WHERE relation.source_task_id=$1 LIMIT 1`, taskID).Scan(&dependent)
 		}
 	}
 	if _, err := tx.Exec(`DELETE FROM side_question_sessions WHERE task_id=$1`, taskID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM audit_sessions WHERE task_id=$1`, taskID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM findings WHERE task_id=$1`, taskID); err != nil {
@@ -276,6 +276,11 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 			return nil, fmt.Errorf("restore %s: %w", table, err)
 		}
 	}
+	for _, table := range []string{"audit_sessions", "audit_phases", "audit_coverage", "audit_detection_intents", "audit_hypotheses", "audit_rounds", "audit_engine_jobs"} {
+		if err := insertArchiveRows(tx, table, remappedTables[table]); err != nil {
+			return nil, fmt.Errorf("restore %s: %w", table, err)
+		}
+	}
 	if err := restoreFindingTrafficTx(tx, snapshot); err != nil {
 		return nil, fmt.Errorf("restore finding traffic: %w", err)
 	}
@@ -393,6 +398,9 @@ func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
 		"task_constraints": true, "activity": true, "task_asset_links": true, "findings": true,
 		"llm_records": true, "llm_usage": true, "skill_usage": true, "tool_usage": true,
 		"side_question_sessions": true, "side_question_requests": true,
+		"audit_sessions": true, "audit_phases": true, "audit_coverage": true,
+		"audit_detection_intents": true, "audit_hypotheses": true, "audit_rounds": true,
+		"audit_engine_jobs": true,
 	}
 	if !allowed[table] {
 		return fmt.Errorf("archive restore table %q is not allowed", table)
@@ -556,15 +564,19 @@ func remapArchiveAssetReferences(tables map[string]json.RawMessage, mapping map[
 	for name, raw := range tables {
 		out[name] = raw
 	}
-	for _, table := range []string{"exploration_anchors", "task_asset_links"} {
+	for _, table := range []string{"exploration_anchors", "task_asset_links", "audit_sessions"} {
 		rows, err := decodeArchiveRows(tables[table])
 		if err != nil {
 			return nil, err
 		}
 		for _, row := range rows {
-			if old, ok := jsonInt64(row["asset_id"]); ok {
+			key := "asset_id"
+			if table == "audit_sessions" {
+				key = "repo_asset_id"
+			}
+			if old, ok := jsonInt64(row[key]); ok {
 				if replacement, exists := mapping[old]; exists {
-					row["asset_id"] = replacement
+					row[key] = replacement
 				}
 			}
 		}

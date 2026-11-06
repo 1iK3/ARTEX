@@ -126,6 +126,7 @@ type auditReportEngines struct {
 	Prepared              map[string]auditReportEnginePrepared   `json:"prepared,omitempty"`
 	Jobs                  map[string]auditReportEngineJobCounts  `json:"jobs"`
 	QueryRecordsAvailable bool                                   `json:"query_records_available"`
+	IntentAnalysis        *auditIntentAnalysisRecord             `json:"intent_analysis,omitempty"`
 	Gaps                  []string                               `json:"gaps"`
 }
 
@@ -315,7 +316,10 @@ func renderAuditReport(in auditReportInput) (string, json.RawMessage, error) {
 	coverage := audit.ComputeCoverage(plan, auditCoverageRows(in.CoverageRows))
 	gates := in.Gates
 	if gates == nil {
-		gates = auditGates(plan, auditPhaseStatuses(in.Phases), auditCoverageRows(in.CoverageRows))
+		gates = auditGates(
+			plan, auditPhaseStatuses(in.Phases), auditCoverageRows(in.CoverageRows),
+			in.Hypotheses, len(in.Findings), in.EngineJobs, parseAuditEnginesRecord(in.Session.Engines),
+		)
 	}
 	gates = sanitizeAuditGates(gates, in.RedactPaths)
 	scope := buildAuditReportScope(plan, in.CoverageRows, in.RedactPaths)
@@ -395,6 +399,21 @@ func renderAuditMarkdown(in auditReportInput, data auditReportMarkdownData) stri
 	fmt.Fprintf(&b, "- 后端：%s；引擎配置：%s\n", inlineMarkdown(firstNonBlank(data.engines.Backend, "unknown")), inlineMarkdown(auditEngineSummary(data.engines)))
 	if state := auditEngineStateSummary(data.engines); state != "" {
 		fmt.Fprintf(&b, "- 引擎状态：%s\n", inlineMarkdown(state))
+	}
+	if analysis := data.engines.IntentAnalysis; analysis != nil {
+		source := analysis.RecognitionSource
+		if source == "" {
+			source = "unknown"
+		}
+		summary := fmt.Sprintf("%s（model=%s，prompt=%s，raw_hash=%s，修复 %d 次，意图 %d 条）",
+			source,
+			firstNonBlank(analysis.Model, "unknown"),
+			firstNonBlank(analysis.PromptVersion, "unknown"),
+			firstNonBlank(analysis.RawOutputHash, "unknown"),
+			analysis.RepairAttempts,
+			analysis.IntentCount,
+		)
+		fmt.Fprintf(&b, "- 意图识别：%s\n", inlineMarkdown(summary))
 	}
 	queryRecords := "不可用/不适用"
 	if data.engines.QueryRecordsAvailable {
@@ -828,6 +847,16 @@ func buildAuditReportEngines(session *db.AuditSession, jobs []db.AuditEngineJob,
 		configured[sanitizeAuditText(engine, redactPaths)] = sanitizeAuditText(mode, redactPaths)
 	}
 	engines.Configured = configured
+	if record.IntentAnalysis != nil {
+		analysis := *record.IntentAnalysis
+		analysis.Model = sanitizeAuditText(analysis.Model, redactPaths)
+		analysis.Error = sanitizeAuditText(analysis.Error, redactPaths)
+		analysis.QueryGaps = sanitizeAuditEngineMessages(analysis.QueryGaps, redactPaths)
+		engines.IntentAnalysis = &analysis
+		for _, gap := range analysis.QueryGaps {
+			engines.Gaps = append(engines.Gaps, sanitizeAuditText(gap, redactPaths))
+		}
+	}
 	for engine, capability := range record.Capabilities {
 		name := sanitizeAuditText(engine, redactPaths)
 		languages := make([]string, 0, len(capability.Languages))

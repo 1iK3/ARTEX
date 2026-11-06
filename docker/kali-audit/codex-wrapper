@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+model="${SAPPER_MODEL:-deepseek-v4.1-flash}"
+append_system=""
+prompt="$(cat)"
+
+while (($#)); do
+  case "$1" in
+    --model)
+      model="${2:-$model}"
+      shift 2
+      ;;
+    --append-system-prompt)
+      append_system="${2:-}"
+      shift 2
+      ;;
+    -p|--output-format|--dangerously-skip-permissions)
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+if [[ -n "$append_system" ]]; then
+  prompt="$append_system
+
+$prompt"
+fi
+
+out="$(mktemp)"
+err="$(mktemp)"
+trap 'rm -f "$out" "$err"' EXIT
+
+if ! codex exec \
+  --skip-git-repo-check \
+  --dangerously-bypass-approvals-and-sandbox \
+  --config model_reasoning_effort=low \
+  --model "$model" \
+  --output-last-message "$out" \
+  - <<< "$prompt" 2> "$err" > /dev/null; then
+  cat "$err" >&2
+  exit 1
+fi
+
+python3 -c 'import json,sys; print(json.dumps({"result": sys.stdin.read()}))' < "$out"

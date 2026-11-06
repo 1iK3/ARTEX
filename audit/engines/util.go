@@ -26,9 +26,17 @@ var (
 
 	engineWindowsPathPattern  = regexp.MustCompile(`(?i)\b[A-Z]:[\\/][^\s"'<>|]*`)
 	engineUNCPathPattern      = regexp.MustCompile(`\\\\[^\s"'<>|]+`)
-	engineUnixHomePathPattern = regexp.MustCompile(
-		`(?:^|[\s"'(=])(/(?:Users|home|tmp|var/folders|private/var|root)/[^\s"'<>|)]+)`,
+	engineUnixPathPattern     = regexp.MustCompile(`(?:^|[\s"'(=,])(/[A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)*)`)
+	engineURLUserInfoPattern  = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@`)
+	engineUserPassPattern     = regexp.MustCompile(`(?i)\b[A-Za-z0-9._%+-]+:[^\s/@]+@`)
+	engineBearerPattern       = regexp.MustCompile(`(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{10,}`)
+	engineSecretAssignPattern = regexp.MustCompile(
+		`(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password|passwd|authorization|account[_-]?key|sas[_-]?token)\b(\s*[:=]\s*)(["']?)[^\s"',;}]{6,}`,
 	)
+	engineKnownSecretPattern = regexp.MustCompile(
+		`\b(gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})\b`,
+	)
+	enginePrivateKeyPattern = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----`)
 )
 
 // RedactEngineText removes absolute host paths from engine error text before
@@ -41,7 +49,7 @@ func RedactEngineText(value string) string {
 	}
 	value = engineWindowsPathPattern.ReplaceAllString(value, "[redacted-path]")
 	value = engineUNCPathPattern.ReplaceAllString(value, "[redacted-path]")
-	value = engineUnixHomePathPattern.ReplaceAllStringFunc(value, func(match string) string {
+	value = engineUnixPathPattern.ReplaceAllStringFunc(value, func(match string) string {
 		index := strings.Index(match, "/")
 		if index < 0 {
 			return match
@@ -66,6 +74,12 @@ func RedactEngineText(value string) string {
 			}
 		}
 	}
+	value = enginePrivateKeyPattern.ReplaceAllString(value, `[REDACTED-PRIVATE-KEY]`)
+	value = engineURLUserInfoPattern.ReplaceAllString(value, `${1}[redacted]@`)
+	value = engineUserPassPattern.ReplaceAllString(value, `[redacted]@`)
+	value = engineBearerPattern.ReplaceAllString(value, `${1}[REDACTED]`)
+	value = engineSecretAssignPattern.ReplaceAllString(value, `${1}${2}${3}[REDACTED]`)
+	value = engineKnownSecretPattern.ReplaceAllString(value, `[REDACTED]`)
 	return value
 }
 
@@ -173,17 +187,17 @@ func classifyExecError(ctx context.Context, err error, stderr string) error {
 		return nil
 	}
 	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return redactEngineError(fmt.Errorf("%w: %v", ErrUnavailable, err))
 	}
 	if errors.Is(err, context.DeadlineExceeded) ||
 		(ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded)) {
-		return fmt.Errorf("%w: %v", ErrTimeout, err)
+		return redactEngineError(fmt.Errorf("%w: %v", ErrTimeout, err))
 	}
 	message := strings.TrimSpace(stderr)
 	if message != "" {
-		return fmt.Errorf("%w: %s", err, truncateForError(message))
+		return redactEngineError(fmt.Errorf("%w: %s", err, RedactEngineText(truncateForError(message))))
 	}
-	return err
+	return redactEngineError(err)
 }
 
 func isBinaryMissing(err error) bool {

@@ -101,6 +101,74 @@ func TestNormalizeConfigRoundDefaults(t *testing.T) {
 	}
 }
 
+func TestNormalizeAuditWorkerConfig(t *testing.T) {
+	cfg := NormalizeConfig(Config{
+		SourceType: SourceZip,
+		UploadID:   "u",
+		Worker: &WorkerConfig{
+			Backend: " codex ",
+			Mode:    " privileged ",
+			Command: "codex",
+			Args:    []string{"exec", "--input", "{{input_file}}", "--output-schema", "{{schema_file}}", "--output", "{{output_file}}"},
+		},
+	})
+	if cfg.Worker == nil {
+		t.Fatalf("Worker = nil, want normalized config")
+	}
+	if cfg.Worker.Backend != WorkerBackendCodex || cfg.Worker.Mode != WorkerModePrivileged {
+		t.Fatalf("Worker backend/mode = %q/%q, want codex/privileged", cfg.Worker.Backend, cfg.Worker.Mode)
+	}
+	if cfg.Worker.TimeoutSeconds != DefaultWorkerTimeoutSeconds {
+		t.Fatalf("TimeoutSeconds = %d, want %d", cfg.Worker.TimeoutSeconds, DefaultWorkerTimeoutSeconds)
+	}
+	if cfg.Worker.Cwd != WorkerCwdWorkspace {
+		t.Fatalf("Cwd = %q, want %q", cfg.Worker.Cwd, WorkerCwdWorkspace)
+	}
+}
+
+func TestValidateAuditWorkerConfig(t *testing.T) {
+	base := func(worker *WorkerConfig) Config {
+		return Config{SourceType: SourceZip, UploadID: "u", Worker: worker}
+	}
+	tests := []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{"nil worker", base(nil), ""},
+		{"builtin", base(&WorkerConfig{Backend: WorkerBackendBuiltin}), ""},
+		{"privileged codex", base(&WorkerConfig{
+			Backend: WorkerBackendCodex,
+			Mode:    WorkerModePrivileged,
+			Command: "codex",
+			Args:    []string{"exec", "--output-schema", "{{schema_file}}", "{{input_file}}"},
+		}), ""},
+		{"unknown backend", base(&WorkerConfig{Backend: "semgrep", Command: "x", Args: []string{"{{input_file}}"}}), "未知的 worker backend"},
+		{"invalid mode", base(&WorkerConfig{Backend: WorkerBackendCodex, Mode: "auto", Command: "x", Args: []string{"{{input_file}}"}}), "无效的 worker mode"},
+		{"builtin command", base(&WorkerConfig{Backend: WorkerBackendBuiltin, Command: "x", Args: []string{"{{input_file}}"}}), "builtin worker 不支持 command"},
+		{"missing command", base(&WorkerConfig{Backend: WorkerBackendCodex, Args: []string{"{{input_file}}"}}), "worker command 必填"},
+		{"missing args", base(&WorkerConfig{Backend: WorkerBackendCodex, Command: "x"}), "worker args 必填"},
+		{"unsupported placeholder", base(&WorkerConfig{Backend: WorkerBackendCodex, Command: "x", Args: []string{"{{goal}}"}}), "不支持的 worker 占位符"},
+		{"negative timeout", base(&WorkerConfig{Backend: WorkerBackendCodex, Command: "x", Args: []string{"{{input_file}}"}, TimeoutSeconds: -1}), "worker timeout_seconds"},
+		{"timeout too high", base(&WorkerConfig{Backend: WorkerBackendCodex, Command: "x", Args: []string{"{{input_file}}"}, TimeoutSeconds: MaxWorkerTimeoutSeconds + 1}), "worker timeout_seconds"},
+		{"empty env key", base(&WorkerConfig{Backend: WorkerBackendCodex, Command: "x", Args: []string{"{{input_file}}"}, Env: map[string]string{"": "v"}}), "worker env key"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateConfig(tc.cfg, nil)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("ValidateConfig() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateConfig() = %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidateConfigValid(t *testing.T) {
 	root := t.TempDir()
 	inside := filepath.Join(root, "project", "src")

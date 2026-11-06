@@ -515,38 +515,133 @@ func TestArchivedFindingNormalizerBackfillsAuditDefaults(t *testing.T) {
 	}
 }
 
-func TestTaskArchiveRejectsCodeAudit(t *testing.T) {
+func TestTaskArchiveCodeAuditRoundTrip(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
 	defer d.Close()
-	task, err := d.CreateTaskWithOptions("audit archive guard", "must not archive", TaskCreateOptions{
+	task, err := d.CreateTaskWithOptions("audit archive roundtrip", "restore audit state", TaskCreateOptions{
 		Mode:        TaskModeCodeAudit,
-		AuditConfig: json.RawMessage(`{"depth":"deep"}`),
+		AuditConfig: json.RawMessage(`{"source_type":"local","depth":"quick","languages":["go"],"max_rounds":1}`),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
+		_, _ = d.Exec(`DELETE FROM audit_sessions WHERE task_id=$1`, task.ID)
 		_, _ = d.Exec(`DELETE FROM task_archives WHERE task_id=$1`, task.ID)
 		_ = d.DeleteTask(task.ID)
 	}()
+	session, err := d.CreateAuditSession(AuditSession{
+		TaskID: task.ID, Status: "done", SourceType: "local", Depth: "quick",
+		Languages: []string{"go"}, Round: 1, MaxRounds: 1,
+		ReportMD: "# audit report", ReportJSON: json.RawMessage(`{"status":"done"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.InsertAuditPhases(session.ID, 1, []AuditPhase{{Phase: "S0", Required: true, Status: "done"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpsertAuditCoverage([]AuditCoverage{{
+		SessionID: session.ID, Round: 1, Kind: "cwe", Language: "go", CWE: "CWE-89",
+		SinkKey: "cwe:go:CWE-89", Status: "covered",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	intent, err := d.InsertAuditDetectionIntent(AuditDetectionIntent{
+		SessionID: session.ID, Round: 1, IntentKey: "intent-1", Origin: "sink_rule",
+		Language: "go", CWE: "CWE-89", Title: "SQL injection", Status: "done",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpsertAuditHypothesis(AuditHypothesis{
+		SessionID: session.ID, Round: 1, HypothesisKey: "hyp-1", Statement: "Tainted input reaches SQL",
+		Status: "confirmed", Priority: 5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.InsertAuditRound(AuditRound{
+		SessionID: session.ID, Round: 1, NewFindings: 1, NewConfirmed: 1,
+		TotalFindings: 1, GateC: "pass", Decision: "done",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpsertAuditEngineJob(AuditEngineJob{
+		SessionID: session.ID, IntentID: &intent.ID, Engine: "codeql", JobKind: "run",
+		QueryHash: "hash-1", Status: "done", ResultCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := d.SetPaused(task.ID, true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.QueueTaskArchive(task.ID); !errors.Is(err, ErrTaskArchiveUnsupported) {
-		t.Fatalf("QueueTaskArchive code_audit error=%v, want ErrTaskArchiveUnsupported", err)
-	}
-	if _, err := d.SnapshotTaskArchive(task.ID); !errors.Is(err, ErrTaskArchiveUnsupported) {
-		t.Fatalf("SnapshotTaskArchive code_audit error=%v, want ErrTaskArchiveUnsupported", err)
-	}
-	var archives int
-	if err := d.QueryRow(`SELECT count(*) FROM task_archives WHERE task_id=$1`, task.ID).Scan(&archives); err != nil {
+	queued, err := d.QueueTaskArchive(task.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if archives != 0 {
-		t.Fatalf("rejected code_audit task created %d archive rows", archives)
+	claimed, err := d.ClaimTaskArchiveJob(t.Context())
+	if err != nil || claimed == nil || claimed.ID != queued.ID || claimed.State != Archiving {
+		t.Fatalf("archive claim=%+v err=%v", claimed, err)
+	}
+	snapshot, err := d.SnapshotTaskArchive(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"audit_sessions", "audit_phases", "audit_coverage", "audit_detection_intents", "audit_hypotheses", "audit_rounds", "audit_engine_jobs"} {
+		if _, ok := snapshot.Tables[table]; !ok {
+			t.Fatalf("snapshot missing audit table %s", table)
+		}
+	}
+	if err := d.CompleteTaskArchive(queued.ID, snapshot, "/tmp/code-audit.tar.zst", "sha", 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	var sessions int
+	if err := d.QueryRow(`SELECT count(*) FROM audit_sessions WHERE task_id=$1`, task.ID).Scan(&sessions); err != nil {
+		t.Fatal(err)
+	}
+	if sessions != 0 {
+		t.Fatalf("archived audit session not compacted: sessions=%d", sessions)
+	}
+	if _, err := d.QueueTaskArchiveRestore(queued.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = d.ClaimTaskArchiveJob(t.Context())
+	if err != nil || claimed == nil || claimed.ID != queued.ID || claimed.State != Restoring {
+		t.Fatalf("restore claim=%+v err=%v", claimed, err)
+	}
+	if _, err := d.RestoreTaskArchive(queued.ID, snapshot, 0); err != nil {
+		t.Fatal(err)
+	}
+	var restoredSession AuditSession
+	if err := d.QueryRow(`SELECT id,task_id,status,source_type,depth,backend,round,max_rounds,report_md,report_json FROM audit_sessions WHERE task_id=$1`, task.ID).
+		Scan(&restoredSession.ID, &restoredSession.TaskID, &restoredSession.Status, &restoredSession.SourceType, &restoredSession.Depth, &restoredSession.Backend, &restoredSession.Round, &restoredSession.MaxRounds, &restoredSession.ReportMD, &restoredSession.ReportJSON); err != nil {
+		t.Fatal(err)
+	}
+	if restoredSession.ID != session.ID || restoredSession.Status != "done" || restoredSession.ReportMD != "# audit report" {
+		t.Fatalf("restored audit session mismatch: got %+v want id=%d status=done report=#audit report", restoredSession, session.ID)
+	}
+	var phases, coverage, intents, hypotheses, rounds, jobs int
+	for _, item := range []struct {
+		query string
+		count *int
+	}{
+		{`SELECT count(*) FROM audit_phases WHERE session_id=$1`, &phases},
+		{`SELECT count(*) FROM audit_coverage WHERE session_id=$1`, &coverage},
+		{`SELECT count(*) FROM audit_detection_intents WHERE session_id=$1`, &intents},
+		{`SELECT count(*) FROM audit_hypotheses WHERE session_id=$1`, &hypotheses},
+		{`SELECT count(*) FROM audit_rounds WHERE session_id=$1`, &rounds},
+		{`SELECT count(*) FROM audit_engine_jobs WHERE session_id=$1`, &jobs},
+	} {
+		if err := d.QueryRow(item.query, session.ID).Scan(item.count); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if phases != 1 || coverage != 1 || intents != 1 || hypotheses != 1 || rounds != 1 || jobs != 1 {
+		t.Fatalf("restored audit rows mismatch: phases=%d coverage=%d intents=%d hypotheses=%d rounds=%d jobs=%d",
+			phases, coverage, intents, hypotheses, rounds, jobs)
 	}
 }
 

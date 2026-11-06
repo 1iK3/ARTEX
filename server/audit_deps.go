@@ -739,6 +739,54 @@ func (d *serverAuditDeps) WriteAuditArtifact(ctx context.Context, taskID int64, 
 	return pathJoinSlash("audit", "artifacts", cleaned), nil
 }
 
+// AttachAuditPOC binds an S10 artifact to a finding explicitly assigned to the
+// same intent. The binding is deliberately narrow: a worker may not attach a
+// PoC to an arbitrary finding, and execution state is always false.
+func (d *serverAuditDeps) AttachAuditPOC(ctx context.Context, taskID, findingID, intentID int64, artifactPath, description string) error {
+	if taskID <= 0 || findingID <= 0 || intentID <= 0 {
+		return errors.New("task_id、finding_id 和 intent_id 必须为正整数")
+	}
+	if _, err := d.session(taskID); err != nil {
+		return err
+	}
+	_, store, err := d.taskAndStore(taskID)
+	if err != nil {
+		return err
+	}
+	node, err := store.GetNode(intentID)
+	if err != nil {
+		return err
+	}
+	if node == nil || node.Kind != db.KindIntent {
+		return fmt.Errorf("意图 %d 不属于任务 %d", intentID, taskID)
+	}
+	if phase := auditIntentPhase(node.Payload); phase != audit.PhasePoC {
+		return fmt.Errorf("PoC 只能绑定 S10 意图，当前意图阶段为 %q", phase)
+	}
+	ids, err := auditIntentFindingIDs(node.Payload)
+	if err != nil {
+		return err
+	}
+	assigned := false
+	for _, id := range ids {
+		if id == findingID {
+			assigned = true
+			break
+		}
+	}
+	if !assigned {
+		return fmt.Errorf("finding #%d 未分配给 S10 意图 #%d", findingID, intentID)
+	}
+	finding, err := d.s.m.pg.GetFinding(findingID)
+	if err != nil {
+		return fmt.Errorf("读取 finding #%d 失败: %w", findingID, err)
+	}
+	if finding == nil || finding.TaskID == nil || *finding.TaskID != taskID {
+		return fmt.Errorf("finding #%d 不存在或不属于任务 %d", findingID, taskID)
+	}
+	return d.s.m.pg.AttachFindingPOC(ctx, taskID, findingID, artifactPath, description)
+}
+
 func pathJoinSlash(parts ...string) string {
 	return strings.TrimPrefix(filepath.ToSlash(filepath.Join(parts...)), "/")
 }
@@ -810,11 +858,38 @@ type auditProgressEngineCapability struct {
 	BuildModeNone bool     `json:"build_mode_none,omitempty"`
 }
 
+type auditProgressCoverageDetail struct {
+	Rows          []auditReportGapRow `json:"rows"`
+	UncoveredCWEs []string            `json:"uncovered_cwes"`
+}
+
+func buildAuditProgressCoverageDetail(plan audit.Plan, rows []db.AuditCoverage) auditProgressCoverageDetail {
+	detail := auditProgressCoverageDetail{
+		Rows:          make([]auditReportGapRow, 0),
+		UncoveredCWEs: append([]string(nil), auditUncoveredCWEs(plan, rows)...),
+	}
+	for _, row := range auditCoverageGapRows(rows) {
+		detail.Rows = append(detail.Rows, auditReportGapRow{
+			Status:   strings.ToLower(strings.TrimSpace(row.Status)),
+			Kind:     strings.ToLower(strings.TrimSpace(row.Kind)),
+			Language: sanitizeAuditText(row.Language, nil),
+			CWE:      strings.ToUpper(strings.TrimSpace(row.CWE)),
+			Module:   sanitizeAuditText(row.Module, nil),
+			Path:     sanitizeAuditText(row.Path, nil),
+			Line:     row.Line,
+			SinkKey:  sanitizeAuditText(row.SinkKey, nil),
+			Reason:   sanitizeAuditText(row.Reason, nil),
+		})
+	}
+	return detail
+}
+
 type auditProgressEngineStatus struct {
-	Capabilities map[string]auditProgressEngineCapability `json:"capabilities"`
-	JobCounts    map[string]auditReportEngineJobCounts    `json:"job_counts"`
-	Warnings     []string                                 `json:"warnings,omitempty"`
-	Gaps         []string                                 `json:"gaps,omitempty"`
+	Capabilities   map[string]auditProgressEngineCapability `json:"capabilities"`
+	JobCounts      map[string]auditReportEngineJobCounts    `json:"job_counts"`
+	IntentAnalysis *auditIntentAnalysisRecord               `json:"intent_analysis,omitempty"`
+	Warnings       []string                                 `json:"warnings,omitempty"`
+	Gaps           []string                                 `json:"gaps,omitempty"`
 }
 
 // buildAuditProgressEngineStatus projects persisted engine state and job
@@ -826,6 +901,7 @@ func buildAuditProgressEngineStatus(session *db.AuditSession, jobs []db.AuditEng
 	}
 	if session != nil {
 		record := parseAuditEnginesRecord(session.Engines)
+		status.IntentAnalysis = record.IntentAnalysis
 		for engine, capability := range record.Capabilities {
 			status.Capabilities[engine] = auditProgressEngineCapability{
 				State:         auditEngineState(capability, record.Configured[engine]),
@@ -911,7 +987,8 @@ func buildAuditProgress(in auditProgressInput) (json.RawMessage, error) {
 	phaseStatuses := auditCompletionPhaseStatuses(in.Phases)
 	rows := auditCoverageRows(in.CoverageRows)
 	coverage := audit.ComputeCoverage(plan, rows)
-	gates := auditGates(plan, phaseStatuses, rows)
+	coverageDetail := buildAuditProgressCoverageDetail(plan, in.CoverageRows)
+	gates := auditGates(plan, phaseStatuses, rows, in.Hypotheses, in.FindingsTotal, in.Engines, parseAuditEnginesRecord(session.Engines))
 
 	intents := make([]auditProgressIntent, 0, len(in.Intents))
 	for _, it := range in.Intents {
@@ -968,7 +1045,8 @@ func buildAuditProgress(in auditProgressInput) (json.RawMessage, error) {
 			"started_at":    session.StartedAt, "completed_at": session.CompletedAt,
 		},
 		"phases":     in.Phases,
-		"coverage":   coverage,
+		"coverage":       coverage,
+		"coverage_detail": coverageDetail,
 		"gates":      gates,
 		"intents":    map[string]any{"counts": intentSummary, "detection": intents},
 		"candidates": candidates,
@@ -1093,13 +1171,21 @@ func (d *serverAuditDeps) AuditProgress(ctx context.Context, taskID int64) (json
 	if err != nil {
 		return nil, err
 	}
+	confirmed, err := listAuditConfirmedHighFindings(ctx, d.s.m.pg, taskID, 200)
+	if err != nil {
+		return nil, err
+	}
 	intentSummary, err := auditIntentSummary(d.s.m.pg, taskID)
 	if err != nil {
 		return nil, err
 	}
-	candidates := buildAuditFindingCandidates(unverified, 8, 5)
-	candidates = append(candidates, buildAuditCoverageCandidates(rows, 8, 25)...)
 	plan := auditPlanFromSession(session)
+	candidates := buildAuditFindingCandidates(unverified, 8, 5)
+	coverageCandidates := buildAuditCoverageCandidates(rows, 8, 25)
+	phaseCandidates := buildAuditPhaseCandidates(plan, phases, confirmed)
+	phaseCandidates = omitDuplicateAuditCoveragePhases(phaseCandidates, coverageCandidates)
+	candidates = append(candidates, phaseCandidates...)
+	candidates = append(candidates, coverageCandidates...)
 	ready, reason := auditReadiness(session, phases, plan, rows)
 	return buildAuditProgress(auditProgressInput{
 		Session: session, Plan: plan, Phases: phases, CoverageRows: rows,
@@ -1108,6 +1194,145 @@ func (d *serverAuditDeps) AuditProgress(ctx context.Context, taskID int64) (json
 		Hypotheses: hypotheses, Engines: engines,
 		Ready: ready, ReadyReason: reason,
 	})
+}
+
+func omitDuplicateAuditCoveragePhases(phaseCandidates, coverageCandidates []auditCoverageCandidate) []auditCoverageCandidate {
+	coveredPhases := make(map[string]struct{})
+	for _, candidate := range coverageCandidates {
+		if candidate.Phase == audit.PhaseDataFlow || candidate.Phase == audit.PhaseDetect {
+			coveredPhases[candidate.Phase] = struct{}{}
+		}
+	}
+	if len(coveredPhases) == 0 {
+		return phaseCandidates
+	}
+	out := make([]auditCoverageCandidate, 0, len(phaseCandidates))
+	for _, candidate := range phaseCandidates {
+		if _, duplicate := coveredPhases[candidate.Phase]; duplicate {
+			continue
+		}
+		out = append(out, candidate)
+	}
+	return out
+}
+
+// listAuditConfirmedHighFindings returns the high/critical findings that require
+// design verification (S8) and a non-executing PoC artifact (S10).
+func listAuditConfirmedHighFindings(ctx context.Context, pg *db.DB, taskID int64, limit int) ([]auditFindingCandidate, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := pg.QueryContext(ctx, `
+SELECT id, COALESCE(cwe_id, ''), COALESCE(severity, '')
+FROM findings
+WHERE task_id=$1
+  AND lower(COALESCE(verification, '')) = 'confirmed'
+  AND lower(COALESCE(severity, '')) IN ('high', 'critical')
+ORDER BY CASE severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 ELSE 0 END DESC,
+         COALESCE(cwe_id, ''), id
+LIMIT $2`, taskID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]auditFindingCandidate, 0)
+	for rows.Next() {
+		var item auditFindingCandidate
+		if err := rows.Scan(&item.ID, &item.CWE, &item.Severity); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// buildAuditPhaseCandidates turns pending deep-chain phases into deterministic
+// planner work. S3/S6/S7/S9 are language/module reviews; S8/S10 are tied to
+// confirmed high/critical finding ids. S11 stays host-owned.
+func buildAuditPhaseCandidates(plan audit.Plan, phases []db.AuditPhase, confirmed []auditFindingCandidate) []auditCoverageCandidate {
+	pending := make(map[string]bool)
+	for _, phase := range phases {
+		if !phase.Required {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(phase.Status))
+		if status == "" || status == "pending" {
+			pending[phase.Phase] = true
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	languages := append([]string(nil), plan.Languages...)
+	sort.Strings(languages)
+	module := ""
+	if len(plan.Modules) > 0 {
+		module = strings.TrimSpace(plan.Modules[0])
+	}
+	out := make([]auditCoverageCandidate, 0)
+	for _, language := range languages {
+		for _, item := range []struct {
+			phase    string
+			priority int
+		}{
+			{audit.PhaseDataFlow, 7},
+			{audit.PhaseLogic, 6},
+			{audit.PhaseOdinDeep, 5},
+			{audit.PhaseDepth, 4},
+		} {
+			if !pending[item.phase] {
+				continue
+			}
+			out = append(out, auditCoverageCandidate{
+				Phase: item.phase, Language: language, Module: module, Priority: item.priority,
+			})
+		}
+	}
+
+	high := make([]auditFindingCandidate, 0, len(confirmed))
+	for _, finding := range confirmed {
+		if finding.ID <= 0 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(finding.Severity)) {
+		case "high", "critical":
+			high = append(high, finding)
+		}
+	}
+	sort.Slice(high, func(i, j int) bool {
+		left, right := auditSeverityRank(high[i].Severity), auditSeverityRank(high[j].Severity)
+		if left != right {
+			return left > right
+		}
+		if high[i].CWE != high[j].CWE {
+			return high[i].CWE < high[j].CWE
+		}
+		return high[i].ID < high[j].ID
+	})
+	if len(high) > 0 {
+		ids := make([]int64, 0, len(high))
+		cwe := high[0].CWE
+		severity := high[0].Severity
+		for _, finding := range high {
+			ids = append(ids, finding.ID)
+		}
+		for _, item := range []struct {
+			phase    string
+			priority int
+		}{
+			{audit.PhaseDesign, 9},
+			{audit.PhasePoC, 10},
+		} {
+			if pending[item.phase] {
+				out = append(out, auditCoverageCandidate{
+					Phase: item.phase, CWE: cwe, Severity: severity,
+					FindingIDs: append([]int64(nil), ids...), Priority: item.priority,
+				})
+			}
+		}
+	}
+	return out
 }
 
 func countAuditUnverifiedFindings(ctx context.Context, pg *db.DB, taskID int64) (int, error) {
@@ -1292,14 +1517,192 @@ func auditCoverageRows(rows []db.AuditCoverage) []audit.CoverageRow {
 	return out
 }
 
-func auditGates(plan audit.Plan, phases []audit.PhaseStatus, rows []audit.CoverageRow) map[string]audit.GateResult {
+func auditGates(
+	plan audit.Plan,
+	phases []audit.PhaseStatus,
+	rows []audit.CoverageRow,
+	hypotheses []db.AuditHypothesis,
+	findingsTotal int,
+	engineJobs []db.AuditEngineJob,
+	engineRecord auditEnginesRecord,
+) map[string]audit.GateResult {
 	if plan.Depth == "" {
 		plan.Depth = audit.DepthDeep
 	}
 	return map[string]audit.GateResult{
-		"phase":    audit.GatePhase(phases),
-		"coverage": audit.GateCoverage(plan, rows, plan.Depth),
-		"cwe":      audit.GateCWE(plan, rows),
+		"phase":      audit.GatePhase(phases),
+		"coverage":   audit.GateCoverage(plan, rows, plan.Depth),
+		"cwe":        audit.GateCWE(plan, rows),
+		"hypothesis": auditHypothesisGate(hypotheses, findingsTotal),
+		"engine":     auditEngineGate(engineJobs, engineRecord, plan.Depth),
+	}
+}
+
+func auditHypothesisGate(hypotheses []db.AuditHypothesis, findingsTotal int) audit.GateResult {
+	violations := make([]string, 0)
+	total := len(hypotheses)
+	if findingsTotal > 0 && total == 0 {
+		violations = append(violations, "findings_without_hypotheses")
+	}
+
+	withinLimit, attempted, confirmed, refuted, pivots := 0, 0, 0, 0, 0
+	seenRefuted := false
+	for i := range hypotheses {
+		status := strings.ToLower(strings.TrimSpace(hypotheses[i].Status))
+		attemptCount := auditHypothesisAttemptCount(hypotheses[i].Attempts)
+		if attemptCount > 0 {
+			attempted++
+		}
+		if attemptCount <= maxAuditHypothesisAttempts {
+			withinLimit++
+		}
+		if attemptCount > maxAuditHypothesisAttempts ||
+			(attemptCount == maxAuditHypothesisAttempts && (status == "testing" || status == "blocked")) {
+			violations = append(violations, fmt.Sprintf("%s(%d attempts, %s)",
+				firstNonBlank(hypotheses[i].HypothesisKey, "hypothesis"), attemptCount, firstNonBlank(status, "untested")))
+		}
+		switch status {
+		case "confirmed":
+			confirmed++
+		case "refuted":
+			refuted++
+		}
+		if status == "refuted" {
+			seenRefuted = true
+			continue
+		}
+		if seenRefuted {
+			pivots++
+		}
+	}
+
+	trailingRefuted := 0
+	for i := len(hypotheses) - 1; i >= 0; i-- {
+		if strings.ToLower(strings.TrimSpace(hypotheses[i].Status)) != "refuted" {
+			break
+		}
+		trailingRefuted++
+	}
+	if trailingRefuted >= 3 {
+		violations = append(violations, fmt.Sprintf("pivot_gap(%d consecutive refuted hypotheses)", trailingRefuted))
+	}
+	sort.Strings(violations)
+
+	discipline := 1.0
+	if findingsTotal > 0 && total == 0 {
+		discipline = 0
+	}
+	pivotRate, attemptRate, outcomeRate := 1.0, 1.0, 1.0
+	if total > 0 {
+		pivotRate = float64(pivots) / float64(total)
+		attemptRate = float64(withinLimit) / float64(total)
+		outcomeRate = float64(confirmed) / float64(total)
+	}
+	score := 30*discipline + 30*pivotRate + 20*attemptRate + 20*outcomeRate
+	warning := score < 70
+	passed := len(violations) == 0
+	reason := fmt.Sprintf("hypothesis quality score %.1f", score)
+	switch {
+	case !passed:
+		reason = fmt.Sprintf("%d hard violation(s): %s", len(violations), strings.Join(violations, "; "))
+	case warning:
+		reason = fmt.Sprintf("hypothesis quality score %.1f (warning: below 70)", score)
+	}
+	return audit.GateResult{
+		Name: "Gate-H", Passed: passed, Reason: reason,
+		Details: map[string]any{
+			"limit": maxAuditHypothesisAttempts, "violations": violations,
+			"findings": findingsTotal, "hypotheses": total,
+			"attempted": attempted, "confirmed": confirmed, "refuted": refuted,
+			"pivot_hypotheses": pivots, "discipline": discipline,
+			"pivot": pivotRate, "attempts": attemptRate, "outcome": outcomeRate,
+			"score": score, "warning": warning,
+			"weights": map[string]int{"discipline": 30, "pivot": 30, "attempts": 20, "outcome": 20},
+		},
+	}
+}
+
+func auditHypothesisAttemptCount(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var attempts []json.RawMessage
+	if err := json.Unmarshal(raw, &attempts); err != nil {
+		return 0
+	}
+	return len(attempts)
+}
+
+func auditEngineGate(jobs []db.AuditEngineJob, record auditEnginesRecord, depth string) audit.GateResult {
+	missing := make([]string, 0)
+	names := make([]string, 0, len(record.Configured))
+	for name, mode := range record.Configured {
+		name = strings.ToLower(strings.TrimSpace(name))
+		mode = strings.ToLower(strings.TrimSpace(mode))
+		if name == "" || mode != "required" {
+			continue
+		}
+		names = append(names, name)
+		capability, ok := record.Capabilities[name]
+		if !ok || !capability.Available {
+			missing = append(missing, name)
+		}
+	}
+	sort.Strings(names)
+	sort.Strings(missing)
+	failed := make([]string, 0)
+	type engineJobCounts struct{ done, failed int }
+	jobCounts := make(map[string]engineJobCounts)
+	for _, job := range jobs {
+		engine := strings.ToLower(strings.TrimSpace(job.Engine))
+		if engine == "" {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(job.Status))
+		counts := jobCounts[engine]
+		switch status {
+		case "done":
+			counts.done++
+		case "failed":
+			counts.failed++
+			failed = append(failed, engine)
+		default:
+			continue
+		}
+		jobCounts[engine] = counts
+	}
+	sort.Strings(failed)
+	threshold := 0.80
+	belowThreshold := make([]string, 0)
+	successRates := make(map[string]float64, len(jobCounts))
+	minimumSuccessRate := 1.0
+	for engine, counts := range jobCounts {
+		rate := 1.0
+		attempted := counts.done + counts.failed
+		if attempted > 0 {
+			rate = float64(counts.done) / float64(attempted)
+		}
+		successRates[engine] = rate
+		if rate < minimumSuccessRate {
+			minimumSuccessRate = rate
+		}
+		if rate < threshold {
+			belowThreshold = append(belowThreshold, engine)
+		}
+	}
+	sort.Strings(belowThreshold)
+	passed := len(missing) == 0 && len(belowThreshold) == 0
+	reason := "required engines ready and engine jobs healthy"
+	if !passed {
+		reason = fmt.Sprintf("missing required engines: %v; engines below %.0f%% success: %v", missing, threshold*100, belowThreshold)
+	}
+	return audit.GateResult{
+		Name: "Gate-Engine", Passed: passed, Reason: reason,
+		Details: map[string]any{
+			"required": names, "missing": missing, "failed": failed,
+			"success_rate": minimumSuccessRate, "success_rates": successRates,
+			"threshold": threshold, "depth": depth, "job_count": len(jobs),
+		},
 	}
 }
 
@@ -1356,8 +1759,9 @@ func auditIntentSummary(pg *db.DB, taskID int64) (map[string]int, error) {
 	return summary, nil
 }
 
-// buildAuditCoverageCandidates turns planned/unassigned sink-site coverage into
-// bounded S4 batches the planner can dispatch via add_intent.audit.sink_keys.
+// buildAuditCoverageCandidates turns planned/unassigned entry-point and
+// sink-site coverage into bounded S3/S4 batches the planner can dispatch via
+// add_intent.audit.sink_keys.
 func buildAuditCoverageCandidates(rows []db.AuditCoverage, maxBatches, batchSize int) []auditCoverageCandidate {
 	if maxBatches <= 0 {
 		maxBatches = 8
@@ -1366,6 +1770,7 @@ func buildAuditCoverageCandidates(rows []db.AuditCoverage, maxBatches, batchSize
 		batchSize = 25
 	}
 	type bucket struct {
+		phase    string
 		language string
 		cwe      string
 		module   string
@@ -1374,7 +1779,8 @@ func buildAuditCoverageCandidates(rows []db.AuditCoverage, maxBatches, batchSize
 	buckets := map[string]*bucket{}
 	order := make([]string, 0)
 	for _, row := range rows {
-		if strings.ToLower(strings.TrimSpace(row.Kind)) != audit.CoverageKindSinkSite {
+		phase := auditPhaseForCoverageKind(row.Kind)
+		if phase == "" {
 			continue
 		}
 		if row.IntentID != nil {
@@ -1384,10 +1790,10 @@ func buildAuditCoverageCandidates(rows []db.AuditCoverage, maxBatches, batchSize
 		if status != audit.CoverageStatusPlanned && status != audit.CoverageStatusMissed {
 			continue
 		}
-		key := row.Language + "\x00" + row.CWE + "\x00" + row.Module
+		key := phase + "\x00" + row.Language + "\x00" + row.CWE + "\x00" + row.Module
 		b := buckets[key]
 		if b == nil {
-			b = &bucket{language: row.Language, cwe: row.CWE, module: row.Module}
+			b = &bucket{phase: phase, language: row.Language, cwe: row.CWE, module: row.Module}
 			buckets[key] = b
 			order = append(order, key)
 		}
@@ -1415,8 +1821,11 @@ func buildAuditCoverageCandidates(rows []db.AuditCoverage, maxBatches, batchSize
 				end = len(b.sinkKeys)
 			}
 			priority := 8
+			if b.phase == audit.PhaseDataFlow {
+				priority = 7
+			}
 			out = append(out, auditCoverageCandidate{
-				Phase: audit.PhaseDetect, CWE: b.cwe, Language: b.language,
+				Phase: b.phase, CWE: b.cwe, Language: b.language,
 				Module: b.module, SinkKeys: append([]string(nil), b.sinkKeys[start:end]...),
 				Priority: priority,
 			})
@@ -1426,6 +1835,17 @@ func buildAuditCoverageCandidates(rows []db.AuditCoverage, maxBatches, batchSize
 		}
 	}
 	return out
+}
+
+func auditPhaseForCoverageKind(kind string) string {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case audit.CoverageKindEntryPoint:
+		return audit.PhaseDataFlow
+	case audit.CoverageKindSinkSite:
+		return audit.PhaseDetect
+	default:
+		return ""
+	}
 }
 
 func (d *serverAuditDeps) session(taskID int64) (*db.AuditSession, error) {

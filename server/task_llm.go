@@ -54,6 +54,28 @@ type taskLLMRuntime struct {
 	agentKey string
 }
 
+type auditIntentLLMProvider struct {
+	runtime *taskLLMRuntime
+}
+
+func (p *auditIntentLLMProvider) Model() string {
+	if p == nil || p.runtime == nil {
+		return ""
+	}
+	cfg, ok := p.runtime.activeCfg()
+	if !ok {
+		return ""
+	}
+	return cfg.Model
+}
+
+func (p *auditIntentLLMProvider) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	if p == nil || p.runtime == nil {
+		return llm.Message{}, "", llm.Usage{}, errors.New("audit intent LLM runtime is unavailable")
+	}
+	return p.runtime.Complete(ctx, req)
+}
+
 type taskLLMError struct {
 	taskID         string
 	chainExhausted bool
@@ -524,6 +546,7 @@ func (s *Server) taskRuntimeAvailable(t *Task, agentKeys ...string) bool {
 	if t == nil || len(agentKeys) == 0 {
 		return false
 	}
+	_, workerKey := plannerWorkerKeys(t)
 	state := t.llmStateSnapshot()
 	unboundReady := false
 	if len(state.ProfileIDs) > 0 {
@@ -534,6 +557,9 @@ func (s *Server) taskRuntimeAvailable(t *Task, agentKeys ...string) bool {
 		_, _, unboundReady = s.globalProvider()
 	}
 	for _, key := range agentKeys {
+		if key == workerKey && externalWorkerConfig(t) {
+			continue
+		}
 		if _, _, ok := s.agentBindingProvider(key); ok {
 			continue
 		}
@@ -542,6 +568,11 @@ func (s *Server) taskRuntimeAvailable(t *Task, agentKeys ...string) bool {
 		}
 	}
 	return true
+}
+
+func externalWorkerConfig(t *Task) bool {
+	cfg, ok := auditWorkerConfig(t)
+	return ok && cfg.Backend != audit.WorkerBackendBuiltin
 }
 
 func (s *Server) invalidateTaskAgents() {
@@ -614,6 +645,12 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
 	window := workerRuntime.CompactionWindow()
 	wk := agent.NewWorker(workerRuntime, "task-router", s.m.dir, tx, window, s.agentMaxTurns(workerKey))
+	if runtime := workerRuntimeForTask(t); runtime != nil {
+		wk.SetExternalRuntime(runtime)
+		if cfg, ok := auditWorkerConfig(t); ok {
+			wk.SetExternalRuntimePrivileged(cfg.Mode == audit.WorkerModePrivileged)
+		}
+	}
 	wk.SetFindingRecorder(s.evidenceStore())
 	wk.SetCompactionWindowResolver(workerRuntime.CompactionWindow)
 	wk.SetNonStreaming(workerRuntime.nonStreaming) // 按任务当前激活 profile 的流式开关(每轮读)
@@ -670,6 +707,50 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	}
 	s.taskAgents[t.ID] = bundle
 	return bundle
+}
+
+func auditWorkerConfig(t *Task) (audit.WorkerConfig, bool) {
+	if t == nil {
+		return audit.WorkerConfig{}, false
+	}
+	if len(t.WorkerConfig) > 0 && strings.TrimSpace(string(t.WorkerConfig)) != "null" {
+		var worker audit.WorkerConfig
+		if err := json.Unmarshal(t.WorkerConfig, &worker); err != nil {
+			return audit.WorkerConfig{}, false
+		}
+		normalized := audit.NormalizeWorkerConfig(&worker)
+		if normalized != nil {
+			return *normalized, true
+		}
+	}
+	if t.Mode != db.TaskModeCodeAudit || len(t.AuditConfig) == 0 {
+		return audit.WorkerConfig{}, false
+	}
+	cfg, err := decodeAuditConfig(t.AuditConfig)
+	if err != nil || cfg == nil {
+		return audit.WorkerConfig{}, false
+	}
+	normalized := audit.NormalizeConfig(*cfg)
+	if normalized.Worker == nil {
+		return audit.WorkerConfig{}, false
+	}
+	return *normalized.Worker, true
+}
+
+func workerRuntimeForTask(t *Task) agent.WorkerRuntime {
+	cfg, ok := auditWorkerConfig(t)
+	if !ok || cfg.Backend == audit.WorkerBackendBuiltin {
+		return nil
+	}
+	return agent.NewCLIRuntime(agent.CLIRuntimeConfig{
+		Backend: cfg.Backend,
+		Mode:    cfg.Mode,
+		Command: cfg.Command,
+		Args:    append([]string(nil), cfg.Args...),
+		Cwd:     cfg.Cwd,
+		Env:     cfg.Env,
+		Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second,
+	})
 }
 
 func (s *Server) syncTaskLLMState(pt *db.Task) {

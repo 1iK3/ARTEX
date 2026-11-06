@@ -1,0 +1,3 @@
+library: true
+name: codeql/util
+version: 2.0.47

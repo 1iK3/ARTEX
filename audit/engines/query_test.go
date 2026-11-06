@@ -86,6 +86,80 @@ func TestRenderJoernTaint(t *testing.T) {
 	}
 }
 
+func TestRenderJoernTaintAppliesSanitizersAndPathScope(t *testing.T) {
+	intent := testJavaTaintIntent()
+	intent.Sanitizers = []Pattern{{Pattern: "setString", Match: MatchMethodCall}}
+	intent.Scope.Paths = []string{"src/main/java"}
+	intent.Scope.Exclude = []string{"src/test"}
+
+	q := mustRender(t, EngineJoern, intent)
+	for _, want := range []string{
+		"artexSanitizers",
+		"setString",
+		"src/main/java",
+		"src/test",
+		"filterNot",
+	} {
+		if !strings.Contains(q.QueryText, want) {
+			t.Errorf("Joern taint query missing %q:\n%s", want, q.QueryText)
+		}
+	}
+	if strings.Count(q.QueryText, "val artexRows") != 1 {
+		t.Errorf("Joern taint query must define artexRows exactly once:\n%s", q.QueryText)
+	}
+	if strings.Contains(q.QueryText, "callSiteStack") {
+		t.Errorf("Joern taint query must not use unsupported callSiteStack:\n%s", q.QueryText)
+	}
+	if !strings.Contains(q.QueryText, "step.code.matches(artexSanitizers)") {
+		t.Errorf("Joern taint query must inspect sanitizer path element code:\n%s", q.QueryText)
+	}
+	if err := validateJoernQueryText(q.QueryText); err != nil {
+		t.Fatalf("validateJoernQueryText: %v", err)
+	}
+}
+
+func TestRenderJoernSinkAppliesPathScope(t *testing.T) {
+	intent := testJavaTaintIntent()
+	intent.QueryKind = QueryKindSink
+	intent.Scope.Paths = []string{"src/main/java"}
+	intent.Scope.Exclude = []string{"src/test"}
+
+	q := mustRender(t, EngineJoern, intent)
+	for _, want := range []string{"src/main/java", "src/test"} {
+		if !strings.Contains(q.QueryText, want) {
+			t.Errorf("Joern sink query missing scope path %q:\n%s", want, q.QueryText)
+		}
+	}
+	if err := validateJoernQueryText(q.QueryText); err != nil {
+		t.Fatalf("validateJoernQueryText: %v", err)
+	}
+}
+
+func TestRenderJoernTaintUsesSinkArgumentsForPythonCAndGo(t *testing.T) {
+	intent := testJavaTaintIntent()
+	intent.Language = audit.Python
+	pythonQuery := mustRender(t, EngineJoern, intent)
+	if !strings.Contains(pythonQuery.QueryText, "sinkCall.argument") {
+		t.Errorf("Joern Python taint must use sink arguments:\n%s", pythonQuery.QueryText)
+	}
+
+	intent.Language = audit.C
+	cQuery := mustRender(t, EngineJoern, intent)
+	if !strings.Contains(cQuery.QueryText, "sinkCall.argument") {
+		t.Errorf("Joern C taint must use sink arguments:\n%s", cQuery.QueryText)
+	}
+
+	intent.Language = audit.Go
+	goQuery := mustRender(t, EngineJoern, intent)
+	if !strings.Contains(goQuery.QueryText, "sinkCall.argument") {
+		t.Errorf("Joern Go taint must use sink arguments:\n%s", goQuery.QueryText)
+	}
+	intent.QueryKind = QueryKindSink
+	if _, err := Render(EngineJoern, intent); err != nil {
+		t.Fatalf("Joern C sink should remain supported: %v", err)
+	}
+}
+
 func TestRenderCodeGraphQuery(t *testing.T) {
 	q := mustRender(t, EngineCodeGraph, testJavaTaintIntent())
 	if q.Template != TemplateCodeGraphExplore || q.ExpectedFormat != FormatCodeGraphText {
@@ -100,6 +174,91 @@ func TestRenderCodeGraphQuery(t *testing.T) {
 	} {
 		if !strings.Contains(q.QueryText, want) {
 			t.Errorf("CodeGraph query missing %q:\n%s", want, q.QueryText)
+		}
+	}
+}
+
+func TestRenderCodeGraphSemanticErrorContractQuery(t *testing.T) {
+	intent := DetectionIntent{
+		ID:        "error-contract",
+		Language:  audit.C,
+		CWE:       "CWE-754",
+		Title:     "Decoder block switch error contract",
+		QueryKind: QueryKindErrorContract,
+		Scope:     Scope{Symbols: []string{"DecodeBlockTypeAndLength"}},
+	}
+
+	q := mustRender(t, EngineCodeGraph, intent)
+	for _, want := range []string{
+		"错误契约审计",
+		"返回值/错误码 taxonomy",
+		"永久错误",
+		"临时可恢复状态",
+		"所有调用方",
+		"宏展开",
+		"重试循环",
+		"证明链",
+		"DecodeBlockTypeAndLength",
+	} {
+		if !strings.Contains(q.QueryText, want) {
+			t.Errorf("CodeGraph semantic query missing %q:\n%s", want, q.QueryText)
+		}
+	}
+	if strings.Contains(q.QueryText, "Trace source to sink") {
+		t.Errorf("semantic query must not use source-to-sink framing:\n%s", q.QueryText)
+	}
+}
+
+func TestRenderCodeQLPythonAndJavaScriptQueries(t *testing.T) {
+	pythonTaint := mustRender(t, EngineCodeQL, taintIntent(audit.Python, "CWE-89", "execute", "request"))
+	if pythonTaint.Template != "codeql/python/taint-v2" ||
+		pythonTaint.ExpectedFormat != FormatSARIF {
+		t.Fatalf("Python taint template = %q/%q", pythonTaint.Template, pythonTaint.ExpectedFormat)
+	}
+	for _, want := range []string{
+		"import python", "DataFlow::ConfigSig", "TaintTracking::Global<ArtexConfig>",
+		"Call call", "call.getFunc().(Name).getId()", "call.getFunc().(Attribute).getName()", "call.getArg(0)",
+		`"request"`, `"execute"`, "@kind path-problem",
+	} {
+		if !strings.Contains(pythonTaint.QueryText, want) {
+			t.Errorf("CodeQL Python taint missing %q:\n%s", want, pythonTaint.QueryText)
+		}
+	}
+
+	pythonSink := mustRender(t, EngineCodeQL, sinkIntent(audit.Python, "CWE-89", "execute"))
+	if pythonSink.Template != "codeql/python/sink-v2" {
+		t.Fatalf("Python sink template = %q", pythonSink.Template)
+	}
+	for _, want := range []string{
+		"import python", "from Call call", "call.getFunc().(Name).getId()",
+		"call.getFunc().(Attribute).getName()", `"execute"`,
+	} {
+		if !strings.Contains(pythonSink.QueryText, want) {
+			t.Errorf("CodeQL Python sink missing %q:\n%s", want, pythonSink.QueryText)
+		}
+	}
+
+	jsTaint := mustRender(t, EngineCodeQL, taintIntent(audit.JavaScript, "CWE-78", "exec", "query"))
+	if jsTaint.Template != "codeql/javascript/taint-v2" {
+		t.Fatalf("JavaScript taint template = %q", jsTaint.Template)
+	}
+	for _, want := range []string{
+		"import javascript", "DataFlow::ConfigSig", "TaintTracking::Global<ArtexConfig>",
+		"InvokeExpr call", "call.getCalleeName()", "call.getArgument(0)",
+		`"query"`, `"exec"`,
+	} {
+		if !strings.Contains(jsTaint.QueryText, want) {
+			t.Errorf("CodeQL JavaScript taint missing %q:\n%s", want, jsTaint.QueryText)
+		}
+	}
+
+	tsSink := mustRender(t, EngineCodeQL, sinkIntent(audit.TypeScript, "CWE-79", "innerHTML"))
+	if tsSink.Template != "codeql/javascript/sink-v2" || tsSink.Language != audit.TypeScript {
+		t.Fatalf("TypeScript sink template/language = %q/%q", tsSink.Template, tsSink.Language)
+	}
+	for _, want := range []string{"import javascript", "from InvokeExpr call", "call.getCalleeName()", `"innerHTML"`} {
+		if !strings.Contains(tsSink.QueryText, want) {
+			t.Errorf("CodeQL JavaScript sink missing %q:\n%s", want, tsSink.QueryText)
 		}
 	}
 }
@@ -129,21 +288,6 @@ func TestRenderAllAndUnsupported(t *testing.T) {
 	}
 	if _, err := Render("unknown", goSink); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("unknown engine error = %v, want ErrUnsupported", err)
-	}
-
-	pythonTaint := taintIntent(audit.Python, "CWE-89", "execute", "request")
-	if _, err := Render(EngineCodeQL, pythonTaint); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("CodeQL Python taint error = %v, want ErrUnsupported", err)
-	}
-
-	pythonSink := sinkIntent(audit.Python, "CWE-89", "execute")
-	if _, err := Render(EngineCodeQL, pythonSink); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("CodeQL Python sink error = %v, want ErrUnsupported (pack/template not verified)", err)
-	}
-
-	jsSink := sinkIntent(audit.TypeScript, "CWE-79", "innerHTML")
-	if _, err := Render(EngineCodeQL, jsSink); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("CodeQL TypeScript sink error = %v, want ErrUnsupported", err)
 	}
 
 	rustSink := sinkIntent(audit.Rust, "CWE-78", "Command")
@@ -241,8 +385,8 @@ func TestRenderFallsBackFromTaintToSink(t *testing.T) {
 }
 
 func TestTemplateFor(t *testing.T) {
-	if _, ok := TemplateFor(EngineCodeQL, audit.TypeScript, QueryKindSink); ok {
-		t.Error("unverified CodeQL TypeScript template should be unsupported")
+	if got, ok := TemplateFor(EngineCodeQL, audit.TypeScript, QueryKindSink); !ok || got != TemplateCodeQLJavaScriptSink {
+		t.Errorf("CodeQL TypeScript template = %q, %v", got, ok)
 	}
 	if got, ok := TemplateFor(EngineJoern, audit.TypeScript, QueryKindTaint); !ok || got != "joern/javascript/taint-reachable-v2" {
 		t.Errorf("TypeScript Joern template = %q, %v", got, ok)
@@ -257,6 +401,10 @@ func TestTemplateFor(t *testing.T) {
 
 func TestQueryCacheFIFOAndKey(t *testing.T) {
 	base := mustRender(t, EngineJoern, testJavaTaintIntent())
+	base.EngineVersion = "4.0.535"
+	base.Commit = "0123456789abcdef"
+	base.IRHash = "intent-ir-v1"
+	base.TemplateVersion = TemplateVersion
 	key := QueryCacheKey(base)
 	if key == "" {
 		t.Fatal("empty cache key")
@@ -272,6 +420,16 @@ func TestQueryCacheFIFOAndKey(t *testing.T) {
 	changed.Template = "joern/java/taint-reachable-v3"
 	if QueryCacheKey(base) == QueryCacheKey(changed) {
 		t.Error("cache key ignores template version")
+	}
+	for name, changedSpec := range map[string]QuerySpec{
+		"engine_version": {EngineVersion: "4.0.536", Commit: base.Commit, IRHash: base.IRHash, TemplateVersion: base.TemplateVersion, QueryKind: base.QueryKind, Params: base.Params},
+		"commit":         {EngineVersion: base.EngineVersion, Commit: "fedcba9876543210", IRHash: base.IRHash, TemplateVersion: base.TemplateVersion, QueryKind: base.QueryKind, Params: base.Params},
+		"ir_hash":        {EngineVersion: base.EngineVersion, Commit: base.Commit, IRHash: "intent-ir-v2", TemplateVersion: base.TemplateVersion, QueryKind: base.QueryKind, Params: base.Params},
+		"template":       {EngineVersion: base.EngineVersion, Commit: base.Commit, IRHash: base.IRHash, TemplateVersion: "v3", QueryKind: base.QueryKind, Params: base.Params},
+	} {
+		if key == QueryCacheKey(changedSpec) {
+			t.Errorf("cache key ignores %s", name)
+		}
 	}
 
 	cache := NewQueryCache(2)

@@ -3,6 +3,7 @@
 // a few fields the backend serializes differently (e.g. created_at as a unix int)
 // are passed through and formatted at the call site.
 
+import { auditFindingVerificationBatchPath } from "@/lib/audit-candidate-batch";
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
@@ -19,8 +20,12 @@ import type {
   Audit,
   AuditCapabilities,
   AuditConfig,
+  AuditFindingVerificationBatchInput,
+  AuditFindingVerificationBatchResult,
   AuditProgress,
   AuditSourceFile,
+  AuditWorkerBackends,
+  AuditWorkerConfig,
   BatchCategoryItem,
   BatchControlItem,
   ChatAttachment,
@@ -254,7 +259,10 @@ export const api = {
   task: (id: string) => get<Task>(`/tasks/${encodeURIComponent(id)}`),
   // ---- code audit ----
   auditProgress: (taskId: string) => get<AuditProgress>(`/tasks/${encodeURIComponent(taskId)}/audit/progress`),
+  auditFindingVerificationBatch: (taskId: string, input: AuditFindingVerificationBatchInput) =>
+    post<AuditFindingVerificationBatchResult>(auditFindingVerificationBatchPath(taskId), input),
   auditCapabilities: () => get<AuditCapabilities>("/audit/capabilities"),
+  workerBackends: () => get<AuditWorkerBackends>("/worker-backends"),
   auditSourceFile: (taskId: string, path: string, line?: number) => {
     const query = new URLSearchParams({ path });
     if (line && line > 0) query.set("line", String(line));
@@ -323,6 +331,7 @@ export const api = {
     goal: string;
     taskMode?: TaskMode;
     audit?: AuditConfig;
+    worker?: AuditWorkerConfig;
     llmProfileIds?: number[];
     sourceTaskIds?: string[];
     companyIds?: number[];
@@ -339,6 +348,7 @@ export const api = {
       goal: input.goal,
       ...(input.taskMode ? { task_mode: input.taskMode } : {}),
       ...(input.audit ? { audit: input.audit } : {}),
+      ...(input.worker ? { worker: input.worker } : {}),
       llm_profile_ids: input.llmProfileIds ?? [],
       source_task_ids: input.sourceTaskIds ?? [],
       company_ids: input.companyIds ?? [],
@@ -365,11 +375,19 @@ export const api = {
     }),
   taskTemplates: () => get<{ templates: TaskTemplate[] }>("/task-templates").then((r) => arr(r.templates)),
   createTaskTemplate: (
-    input: Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules">,
+    input: Pick<
+      TaskTemplate,
+      "name" | "description" | "goal" | "category_id" | "intercept_rules" | "task_mode" | "audit_config"
+    >,
   ) => post<TaskTemplate>("/task-templates", input),
   updateTaskTemplate: (
     id: number,
-    input: Partial<Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules">>,
+    input: Partial<
+      Pick<
+        TaskTemplate,
+        "name" | "description" | "goal" | "category_id" | "intercept_rules" | "task_mode" | "audit_config"
+      >
+    >,
   ) => patch<TaskTemplate>(`/task-templates/${id}`, input),
   deleteTaskTemplate: (id: number) => del<{ deleted: number }>(`/task-templates/${id}`),
   updateTaskLLMProfiles: (id: string, llmProfileIds: number[], activeLLMProfileId?: number) =>
@@ -898,8 +916,7 @@ export const api = {
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
   notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
-  notifyChannels: () =>
-    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
     kind: string;

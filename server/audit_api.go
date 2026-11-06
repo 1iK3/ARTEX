@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,9 +20,16 @@ import (
 )
 
 const (
-	auditSourceWindowLines  = 200
-	auditEngineProbeTimeout = 4 * time.Second
-	auditVersionOutputLimit = 200
+	auditSourceWindowLines              = 200
+	auditEngineProbeTimeout             = 4 * time.Second
+	auditVersionOutputLimit             = 200
+	auditVerificationBatchMaxFindings   = 200
+	auditVerificationBatchEvidenceLimit = 4000
+)
+
+var (
+	errAuditFindingNotOwned     = errors.New("finding does not belong to task")
+	errAuditFindingNotCandidate = errors.New("finding is not an unverified candidate")
 )
 
 // auditTaskForRequest resolves a code_audit task and rejects non-audit tasks.
@@ -52,6 +60,155 @@ func (s *Server) auditSessionForTask(t *Task) (*db.AuditSession, error) {
 		return nil, err
 	}
 	return s.m.pg.GetAuditSession(id)
+}
+
+type auditFindingVerificationBatchRequest struct {
+	FindingIDs   []int64  `json:"finding_ids"`
+	Verification string   `json:"verification"`
+	Method       string   `json:"method"`
+	Evidence     string   `json:"evidence"`
+	Confidence   *float64 `json:"confidence"`
+}
+
+type auditFindingVerificationBatchPlan struct {
+	FindingIDs   []int64
+	Verification string
+	Method       string
+	Evidence     string
+	Confidence   *float64
+}
+
+type auditFindingVerificationStore interface {
+	GetFinding(id int64) (*db.DBFinding, error)
+	UpdateFindingVerification(
+		ctx context.Context,
+		taskID, findingID int64,
+		verification, method, evidence, altPath string,
+		confidence *float64,
+	) error
+}
+
+func buildAuditFindingVerificationBatchPlan(
+	request auditFindingVerificationBatchRequest,
+) (auditFindingVerificationBatchPlan, error) {
+	plan := auditFindingVerificationBatchPlan{
+		Verification: strings.ToLower(strings.TrimSpace(request.Verification)),
+		Method:       strings.TrimSpace(request.Method),
+		Evidence:     strings.TrimSpace(request.Evidence),
+		Confidence:   request.Confidence,
+	}
+	switch plan.Verification {
+	case audit.VerificationConfirmed, audit.VerificationRefuted, audit.VerificationDesignIntent:
+	default:
+		return plan, fmt.Errorf("verification 必须是 %s、%s 或 %s",
+			audit.VerificationConfirmed, audit.VerificationRefuted, audit.VerificationDesignIntent)
+	}
+	if plan.Method == "" {
+		plan.Method = audit.MethodManual
+	}
+	if !audit.ValidVerificationMethod(plan.Method) {
+		return plan, fmt.Errorf("未知的 verification method %q", plan.Method)
+	}
+	if plan.Evidence == "" {
+		return plan, errors.New("verification evidence 不能为空")
+	}
+	if len([]rune(plan.Evidence)) > auditVerificationBatchEvidenceLimit {
+		return plan, fmt.Errorf("verification evidence 不能超过 %d 个字符", auditVerificationBatchEvidenceLimit)
+	}
+	if plan.Confidence != nil && (*plan.Confidence < 0 || *plan.Confidence > 1) {
+		return plan, fmt.Errorf("confidence %v 必须在 [0,1] 内", *plan.Confidence)
+	}
+
+	seen := make(map[int64]struct{}, len(request.FindingIDs))
+	plan.FindingIDs = make([]int64, 0, len(request.FindingIDs))
+	for _, id := range request.FindingIDs {
+		if id <= 0 {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		plan.FindingIDs = append(plan.FindingIDs, id)
+	}
+	if len(plan.FindingIDs) == 0 {
+		return plan, errors.New("finding_ids 不能为空")
+	}
+	if len(plan.FindingIDs) > auditVerificationBatchMaxFindings {
+		return plan, fmt.Errorf("一次最多批量验证 %d 条 finding", auditVerificationBatchMaxFindings)
+	}
+	return plan, nil
+}
+
+func applyAuditFindingVerificationBatch(
+	ctx context.Context,
+	store auditFindingVerificationStore,
+	taskID int64,
+	plan auditFindingVerificationBatchPlan,
+) error {
+	for _, findingID := range plan.FindingIDs {
+		finding, err := store.GetFinding(findingID)
+		if err != nil {
+			return err
+		}
+		if finding == nil || finding.TaskID == nil || *finding.TaskID != taskID {
+			return fmt.Errorf("%w: finding %d", errAuditFindingNotOwned, findingID)
+		}
+		current := strings.ToLower(strings.TrimSpace(finding.Verification))
+		if current == "" {
+			current = audit.VerificationUnverified
+		}
+		if current != audit.VerificationCandidate && current != audit.VerificationUnverified {
+			return fmt.Errorf("%w: finding %d is %q", errAuditFindingNotCandidate, findingID, current)
+		}
+	}
+	for _, findingID := range plan.FindingIDs {
+		if err := store.UpdateFindingVerification(
+			ctx, taskID, findingID, plan.Verification, plan.Method, plan.Evidence, "", plan.Confidence,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) auditFindingVerificationBatch(w http.ResponseWriter, r *http.Request) {
+	t, ok := s.auditTaskForRequest(w, r)
+	if !ok {
+		return
+	}
+	taskID, err := parseTaskID(t.ID)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	var request auditFindingVerificationBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	plan, err := buildAuditFindingVerificationBatchPlan(request)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := applyAuditFindingVerificationBatch(r.Context(), s.m.pg, taskID, plan); err != nil {
+		if errors.Is(err, errAuditFindingNotOwned) || errors.Is(err, db.ErrFindingNotFound) {
+			writeErr(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, errAuditFindingNotCandidate) {
+			writeErr(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"updated":      len(plan.FindingIDs),
+		"verification": plan.Verification,
+	})
 }
 
 // auditProgress serves the server-computed progress projection. It intentionally

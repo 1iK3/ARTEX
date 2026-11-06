@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/audit"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
@@ -105,7 +107,9 @@ type Worker struct {
 	// notify, if set, is the generic planner wake (debounced by the engine). It
 	// makes audit verification/hypothesis/intent-complete writes visible to the
 	// planner even though they are not new findings. nil = no wake.
-	notify func()
+	notify                    func()
+	externalRuntime           WorkerRuntime
+	externalRuntimePrivileged bool
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -236,6 +240,25 @@ const settleWrapUpPrompt = "你即将因预算耗尽被终止。不要再运行�
 
 func NewWorker(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int, extra ...actool.CoreTool) *Worker {
 	return &Worker{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, extraTools: extra}
+}
+
+func (w *Worker) SetExternalRuntime(runtime WorkerRuntime) {
+	w.externalRuntime = runtime
+}
+
+func (w *Worker) SetExternalRuntimePrivileged(privileged bool) {
+	w.externalRuntimePrivileged = privileged
+}
+
+func (w *Worker) ExternalRuntimeName() string {
+	if w == nil || w.externalRuntime == nil {
+		return ""
+	}
+	return w.externalRuntime.Name()
+}
+
+func (w *Worker) ExternalRuntimePrivileged() bool {
+	return w != nil && w.externalRuntimePrivileged
 }
 
 // defaultToolsExcept returns actool.DefaultTools() minus the named tools (by
@@ -409,7 +432,15 @@ func renderIntentTask(intent *db.Node) string {
 // renderAuditIntentTask is the code-audit variant: write-back tools are the
 // audit ones, and completing the intent requires a coverage receipt.
 func renderAuditIntentTask(intent *db.Node) string {
-	return fmt.Sprintf("\n\n【你领到的审计意图（本次唯一任务：完成它并提交覆盖回执）】：\n%s\n意图 id: %d（report_code_finding / audit_intent_complete 时传它）", string(intent.Payload), intent.ID)
+	return fmt.Sprintf("\n\n【你领到的审计意图（本次唯一任务：完成它并提交覆盖回执）】：\n%s\n意图 id: %d（report_code_finding / audit_intent_complete 时传它）\n%s", string(intent.Payload), intent.ID, auditWorkerMethodologyPrompt())
+}
+
+func auditWorkerMethodologyPrompt() string {
+	return "\n\n【审计方法论】：\n" +
+		"- 先定位入口点和攻击者可控输入，再追踪状态机与错误契约。\n" +
+		"- 区分永久错误和临时可恢复状态，检查调用方契约是否把两者混用。\n" +
+		"- 执行宏展开，追踪所有调用方、重试循环和固定大小缓冲的交互。\n" +
+		"- 每个结论必须先形成证明链，再做反证；只有反证失败才报告为候选漏洞。\n"
 }
 
 // renderWorkerGraphOverview folds the global situational snapshot into the worker's
@@ -454,6 +485,9 @@ func (w *Worker) ExecuteWithMessage(ctx context.Context, name string, taskID int
 }
 
 func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, intent *db.Node, hooks harness.HookRunner, emit func(db.Activity), enr EnrichTrigger, notifyFinding func(int64, string), requestID, message string) (harness.TerminalReason, WriteCounts, error) {
+	if w.externalRuntime != nil {
+		return w.executeExternal(ctx, name, taskID, ts, intent, emit, notifyFinding, requestID, message)
+	}
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)
@@ -680,4 +714,290 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// pause / planner kill / shutdown, which the engine distinguishes and re-queues/stops.
 	_, reason, err := captureRunSession(ctx, s, input, emitWrap)
 	return reason, tsx.Writes(), err
+}
+
+func (w *Worker) executeExternal(ctx context.Context, name string, taskID int64, ts *db.ExplorationStore, intent *db.Node, emit func(db.Activity), notifyFinding func(int64, string), requestID, message string) (harness.TerminalReason, WriteCounts, error) {
+	prompt := string(intent.Payload)
+	if strings.TrimSpace(message) != "" {
+		prompt += "\n\n" + message
+	}
+	outputDir := filepath.Join(w.workDir, "audit", "workers", fmt.Sprintf("intent-%d", intent.ID))
+	workspace := w.auditSourceRoot
+	if workspace == "" {
+		workspace = w.workDir
+	}
+	if !w.auditMode {
+		// Pentest workers run inside the intent's own artifact directory and
+		// carry the pentest role prompt plus the JSON write-back contract, so
+		// CLIs without schema enforcement (e.g. opencode run) still return
+		// parseable results.
+		workspace = ensureRunDir(w.workDir, taskID, intent.ID)
+		outputDir = filepath.Join(workspace, "worker-cli")
+		prompt = pentestExternalPrompt(intent, message)
+	}
+	req := WorkerRequest{
+		TaskID:       taskID,
+		IntentID:     intent.ID,
+		Name:         name,
+		Prompt:       prompt,
+		Workspace:    workspace,
+		SnapshotRoot: workspace,
+		OutputDir:    outputDir,
+		Privileged:   w.externalRuntimePrivileged,
+		Audit:        w.auditMode,
+	}
+	result, runErr := w.externalRuntime.Run(ctx, req)
+	var writes WriteCounts
+	var recordErr error
+	if w.auditMode {
+		writes, recordErr = w.recordExternalFindings(ctx, name, taskID, ts, intent, result, notifyFinding)
+	} else {
+		writes, recordErr = w.recordExternalPentestResult(ctx, name, taskID, ts, intent, &result, notifyFinding)
+	}
+	if emit != nil {
+		intentID := intent.ID
+		detail := result.RawOutput
+		if len(result.Warnings) > 0 {
+			detail = strings.TrimSpace(detail + "\n\n【警告】\n" + strings.Join(result.Warnings, "\n"))
+		}
+		emit(db.Activity{
+			Worker:  name,
+			Kind:    "text",
+			Summary: firstNonEmptyAgent(result.Summary, "外部 worker 完成"),
+			Detail:  detail,
+			NodeID:  &intentID,
+		})
+	}
+	if recordErr != nil {
+		return harness.ReasonModelError, writes, recordErr
+	}
+	if runErr != nil {
+		if result.Status == externalWorkerStatusTimeout || errors.Is(runErr, context.DeadlineExceeded) {
+			return harness.ReasonTimeout, writes, runErr
+		}
+		return harness.ReasonModelError, writes, runErr
+	}
+	if result.Status == externalWorkerStatusFailed {
+		return harness.ReasonModelError, writes, fmt.Errorf("外部 worker %s 返回失败状态", w.externalRuntime.Name())
+	}
+	return harness.ReasonCompleted, writes, nil
+}
+
+// pentestExternalPrompt renders the one-intent job for an external CLI agent.
+// It condenses the builtin worker contract (single intent, authorized scope,
+// evidence-based findings, stop when done) and pins the JSON result shape.
+func pentestExternalPrompt(intent *db.Node, message string) string {
+	var b strings.Builder
+	b.WriteString("你是授权渗透测试平台的执行 worker，刚领取了一条意图。你的唯一职责：完成这一条意图、给出结论、然后停止。\n")
+	b.WriteString("规则：\n")
+	b.WriteString("1. 只做这条意图内的探测；只在授权范围内操作，探测前自检是否越权或破坏。\n")
+	b.WriteString("2. 所有结论必须来自你真实执行的命令/请求输出；没有复现证据的线索写进 summary，不要报成 finding。\n")
+	b.WriteString("3. findings 只收录本次真实触发、且带可复现证据（请求/响应或命令输出）的漏洞。\n")
+	b.WriteString("4. 脚本、payload、抓包等中间产物一律写在当前工作目录（workspace）下，不要写 /tmp 或其它绝对路径。\n\n")
+	fmt.Fprintf(&b, "【你领到的意图（本次唯一任务）】：\n%s\n意图 id: %d\n\n", string(intent.Payload), intent.ID)
+	if trimmed := strings.TrimSpace(message); trimmed != "" {
+		fmt.Fprintf(&b, "【人工补充指令】：\n%s\n\n", trimmed)
+	}
+	b.WriteString(`完成后只输出一个 JSON 对象（不要包裹 Markdown、不要输出其它文字）：`)
+	b.WriteString(`{"status":"done|failed|timeout","summary":"一句话总结本次探测结论（必填）",`)
+	b.WriteString(`"findings":[{"title":"漏洞标题","vuln_class":"漏洞类别，如 SQL Injection","cwe_id":"CWE-89",`)
+	b.WriteString(`"severity":"critical|high|medium|low","summary":"发现摘要",`)
+	b.WriteString(`"evidence":"可复现证据：命令 + 最关键的一两行输出","confidence":0.75}],`)
+	b.WriteString(`"notes":["补充说明或移交规划者的线索"]}`)
+	return b.String()
+}
+
+// recordExternalPentestResult writes an external pentest worker's outcome back
+// into the exploration graph: the summary becomes a fact anchored to the intent
+// (so the planner learns what happened), and findings go through the regular
+// pentest finding store with PoC-shaped evidence.
+func (w *Worker) recordExternalPentestResult(ctx context.Context, name string, taskID int64, ts *db.ExplorationStore, intent *db.Node, result *WorkerResult, notifyFinding func(int64, string)) (WriteCounts, error) {
+	var writes WriteCounts
+	if result.Status == externalWorkerStatusFailed {
+		// Failed CLI runs are re-queued; recording the error text as a fact
+		// would inflate the graph on every retry.
+		return writes, nil
+	}
+	if ts == nil {
+		if len(result.Findings) > 0 || strings.TrimSpace(result.Summary) != "" || strings.TrimSpace(result.RawOutput) != "" {
+			return writes, errors.New("外部 worker 结果无法入库：探索存储不可用")
+		}
+		return writes, nil
+	}
+	summary := strings.TrimSpace(result.Summary)
+	if summary == "" {
+		summary = externalSummaryFallback(result.RawOutput)
+	}
+	if summary != "" {
+		payload := map[string]any{"summary": summary, "confidence": "observed"}
+		if detail := strings.TrimSpace(result.RawOutput); detail != "" && detail != summary {
+			payload["detail"] = detail
+		}
+		if len(result.Warnings) > 0 {
+			payload["warnings"] = result.Warnings
+		}
+		factID, err := ts.AddNode(db.KindFact, payload, 5, "confirmed", name, nil)
+		if err != nil {
+			return writes, err
+		}
+		if err := ts.Link(intent.ID, db.RelYields, factID); err != nil {
+			return writes, err
+		}
+		writes.Facts++
+	}
+	for _, finding := range result.Findings {
+		title := strings.TrimSpace(finding.Title)
+		severity := strings.ToLower(strings.TrimSpace(finding.Severity))
+		if title == "" || !validPentestSeverity(severity) {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("跳过无效外部 finding: %s", title))
+			continue
+		}
+		vulnClass := strings.TrimSpace(finding.VulnClass)
+		if vulnClass == "" {
+			vulnClass = strings.TrimSpace(finding.CWEID)
+		}
+		if vulnClass == "" {
+			vulnClass = "Uncategorized"
+		}
+		findingSummary := firstNonEmptyAgent(finding.Summary, title)
+		input := db.RecordFindingInput{
+			TaskID:        taskID,
+			ExplorationID: ts.ID(),
+			IntentID:      intent.ID,
+			VulnClass:     vulnClass,
+			Name:          title,
+			Severity:      severity,
+			Summary:       findingSummary,
+			Evidence:      firstNonEmptyAgent(finding.Evidence, title),
+			Worker:        name,
+		}
+		var recorded *db.RecordedFinding
+		var err error
+		if w.findingRecorder != nil {
+			recorded, err = w.findingRecorder.Record(ctx, input, nil)
+		} else {
+			recorded, err = ts.RecordFinding(ctx, input)
+		}
+		if err != nil {
+			return writes, err
+		}
+		if recorded != nil && !recorded.Duplicate {
+			writes.Findings++
+			if notifyFinding != nil {
+				notifyFinding(intent.ID, findingSummary)
+			} else if w.notify != nil {
+				w.notify()
+			}
+		}
+	}
+	return writes, nil
+}
+
+func validPentestSeverity(severity string) bool {
+	switch severity {
+	case "critical", "high", "medium", "low":
+		return true
+	}
+	return false
+}
+
+func externalSummaryFallback(raw string) string {
+	for _, line := range strings.Split(raw, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if runes := []rune(trimmed); len(runes) > 500 {
+			return string(runes[:500]) + "…"
+		}
+		return trimmed
+	}
+	return ""
+}
+
+func (w *Worker) recordExternalFindings(ctx context.Context, name string, taskID int64, ts *db.ExplorationStore, intent *db.Node, result WorkerResult, notifyFinding func(int64, string)) (WriteCounts, error) {
+	var writes WriteCounts
+	if w.auditDeps == nil {
+		if len(result.Findings) > 0 {
+			return writes, errors.New("外部 worker 结果无法入库：审计持久化服务未接入")
+		}
+		return writes, nil
+	}
+	for _, finding := range result.Findings {
+		cwe := strings.ToUpper(strings.TrimSpace(finding.CWEID))
+		severity := strings.ToLower(strings.TrimSpace(finding.Severity))
+		title := strings.TrimSpace(finding.Title)
+		symbol := strings.TrimSpace(finding.Symbol)
+		if symbol == "" {
+			symbol = title
+		}
+		confidence := finding.Confidence
+		if confidence <= 0 {
+			confidence = 0.5
+		}
+		if cwe == "" || title == "" || !audit.ValidSeverity(severity) || finding.Line <= 0 || finding.File == "" || symbol == "" {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("跳过无效外部 finding: %s", title))
+			continue
+		}
+		normalizedPath := audit.NormalizeCodePath(finding.File)
+		evidence := audit.CodeEvidence{
+			Version:    audit.CodeEvidenceVersion,
+			CWEID:      cwe,
+			Title:      title,
+			Severity:   severity,
+			Confidence: confidence,
+			Verification: audit.Verification{
+				Status: audit.VerificationCandidate,
+			},
+			Location: audit.CodeLocation{
+				Path:   normalizedPath,
+				Line:   finding.Line,
+				Symbol: symbol,
+			},
+			Analysis: audit.Analysis{
+				IntentID: intent.ID,
+				Backend:  w.externalRuntime.Name(),
+			},
+		}
+		if err := audit.ValidateCodeEvidenceFor(evidence, audit.VerificationCandidate); err != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("跳过证据不完整的外部 finding %s: %v", title, err))
+			continue
+		}
+		raw, err := audit.MarshalCodeEvidence(evidence)
+		if err != nil {
+			return writes, err
+		}
+		input := db.RecordFindingInput{
+			TaskID:        taskID,
+			ExplorationID: explorationID(ts),
+			IntentID:      intent.ID,
+			VulnClass:     cwe,
+			Name:          title,
+			Severity:      severity,
+			Summary:       firstNonEmptyAgent(finding.Summary, title),
+			Evidence:      firstNonEmptyAgent(finding.Evidence, title),
+			Worker:        name,
+			CWEID:         cwe,
+			CodePath:      normalizedPath,
+			CodeLine:      finding.Line,
+			CodeSymbol:    symbol,
+			Confidence:    confidence,
+			Verification:  audit.VerificationCandidate,
+			DedupeKey:     audit.DedupeKey(cwe, normalizedPath, finding.Line, symbol),
+			CodeEvidence:  raw,
+		}
+		recorded, err := w.auditDeps.ReportCodeFinding(ctx, input)
+		if err != nil {
+			return writes, err
+		}
+		if recorded != nil && !recorded.Duplicate {
+			writes.Findings++
+			if notifyFinding != nil {
+				notifyFinding(intent.ID, input.Summary)
+			} else if w.notify != nil {
+				w.notify()
+			}
+		}
+	}
+	return writes, nil
 }

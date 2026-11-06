@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/audit"
+	"github.com/Autumn-27/artex/audit/engines"
 	"github.com/Autumn-27/artex/db"
 )
 
@@ -19,19 +20,24 @@ func TestDecideAuditCompletion(t *testing.T) {
 		unverified int
 		gates      bool
 		atMax      bool
+		zeroStreak int
 		candidates bool
+		phase      bool
 		want       auditCompletionDecision
 	}{
-		{"active work waits", 1, 0, true, true, true, auditDecisionWait},
-		{"unverified requests S5", 0, 2, true, true, true, auditDecisionRequestVerification},
-		{"gates pass completes", 0, 0, true, false, false, auditDecisionComplete},
-		{"max rounds forces gaps", 0, 0, false, true, true, auditDecisionCompleteWithGaps},
-		{"coverage candidates retry", 0, 0, false, false, true, auditDecisionRetryCoverage},
-		{"no candidates forces gaps", 0, 0, false, false, false, auditDecisionCompleteWithGaps},
+		{"active work waits", 1, 0, true, true, 0, true, false, auditDecisionWait},
+		{"unverified requests S5", 0, 2, true, true, 0, true, false, auditDecisionRequestVerification},
+		{"gates pass completes", 0, 0, true, false, 0, false, false, auditDecisionComplete},
+		{"max rounds forces gaps", 0, 0, false, true, 0, true, true, auditDecisionCompleteWithGaps},
+		{"zero streak converges", 0, 0, false, false, 2, true, true, auditDecisionCompleteWithGaps},
+		{"single zero round retries", 0, 0, false, false, 1, true, false, auditDecisionRetryCoverage},
+		{"coverage candidates retry", 0, 0, false, false, 0, true, false, auditDecisionRetryCoverage},
+		{"deep phase candidates wait", 0, 0, false, false, 0, false, true, auditDecisionWait},
+		{"no candidates forces gaps", 0, 0, false, false, 0, false, false, auditDecisionCompleteWithGaps},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := decideAuditCompletion(tc.active, tc.unverified, tc.gates, tc.atMax, tc.candidates)
+			got := decideAuditCompletion(tc.active, tc.unverified, tc.gates, tc.atMax, tc.zeroStreak, tc.candidates, tc.phase)
 			if got != tc.want {
 				t.Fatalf("decision = %q, want %q", got, tc.want)
 			}
@@ -165,6 +171,236 @@ func TestBuildAuditFindingCandidates(t *testing.T) {
 	limited := buildAuditFindingCandidates(findings, 2, 5)
 	if len(limited) != 2 {
 		t.Fatalf("max batches not applied: %+v", limited)
+	}
+}
+
+func TestBuildAuditPhaseCandidatesForDeepChain(t *testing.T) {
+	plan := audit.Plan{
+		Depth: audit.DepthDeep, Languages: []string{"java"}, Modules: []string{"src"},
+	}
+	phases := []db.AuditPhase{
+		{Phase: audit.PhaseDataFlow, Required: true, Status: "pending"},
+		{Phase: audit.PhaseLogic, Required: true, Status: "pending"},
+		{Phase: audit.PhaseOdinDeep, Required: true, Status: "pending"},
+		{Phase: audit.PhaseDesign, Required: true, Status: "pending"},
+		{Phase: audit.PhaseDepth, Required: true, Status: "pending"},
+		{Phase: audit.PhasePoC, Required: true, Status: "pending"},
+		{Phase: audit.PhaseReport, Required: true, Status: "pending"},
+	}
+	confirmed := []auditFindingCandidate{
+		{ID: 1, CWE: "CWE-89", Severity: "high"},
+		{ID: 2, CWE: "CWE-78", Severity: "critical"},
+		{ID: 3, CWE: "CWE-79", Severity: "low"},
+	}
+	candidates := buildAuditPhaseCandidates(plan, phases, confirmed)
+	byPhase := make(map[string][]auditCoverageCandidate)
+	for _, candidate := range candidates {
+		byPhase[candidate.Phase] = append(byPhase[candidate.Phase], candidate)
+	}
+	for _, phase := range []string{
+		audit.PhaseDataFlow, audit.PhaseLogic, audit.PhaseOdinDeep,
+		audit.PhaseDesign, audit.PhaseDepth, audit.PhasePoC,
+	} {
+		if len(byPhase[phase]) == 0 {
+			t.Fatalf("%s has no actionable candidate: %+v", phase, candidates)
+		}
+	}
+	if len(byPhase[audit.PhaseReport]) != 0 {
+		t.Fatalf("S11 must stay host-owned: %+v", byPhase[audit.PhaseReport])
+	}
+	for _, phase := range []string{audit.PhaseDataFlow, audit.PhaseLogic, audit.PhaseOdinDeep, audit.PhaseDepth} {
+		if byPhase[phase][0].Language != "java" {
+			t.Fatalf("%s candidate language = %q, want java", phase, byPhase[phase][0].Language)
+		}
+	}
+	for _, phase := range []string{audit.PhaseDesign, audit.PhasePoC} {
+		got := byPhase[phase][0].FindingIDs
+		if len(got) != 2 || got[0] != 2 || got[1] != 1 {
+			t.Fatalf("%s finding_ids = %v, want [2 1]", phase, got)
+		}
+	}
+
+	phases[0].Status = "done"
+	quick := buildAuditPhaseCandidates(audit.Plan{Depth: audit.DepthQuick, Languages: []string{"go"}}, phases, nil)
+	for _, candidate := range quick {
+		if candidate.Phase == audit.PhaseDataFlow {
+			t.Fatalf("completed S3 must not be re-dispatched: %+v", quick)
+		}
+	}
+}
+
+func TestBuildAuditCoverageCandidatesIncludesS3EntryPoints(t *testing.T) {
+	rows := []db.AuditCoverage{
+		{Kind: audit.CoverageKindEntryPoint, Language: "go", CWE: "CWE-89", Module: "api",
+			Path: "api/handler.go", Symbol: "Handle", SinkKey: "entry:api/handler.go:Handle",
+			Status: audit.CoverageStatusPlanned},
+		{Kind: audit.CoverageKindSinkSite, Language: "go", CWE: "CWE-89", Module: "api",
+			Path: "api/db.go", Symbol: "Query", SinkKey: "sink:api/db.go:Query",
+			Status: audit.CoverageStatusPlanned},
+	}
+	candidates := buildAuditCoverageCandidates(rows, 8, 25)
+	if len(candidates) != 2 {
+		t.Fatalf("candidates = %+v, want one S3 and one S4 batch", candidates)
+	}
+	if candidates[0].Phase != audit.PhaseDataFlow || candidates[0].Language != "go" ||
+		candidates[0].Module != "api" || len(candidates[0].SinkKeys) != 1 ||
+		candidates[0].SinkKeys[0] != "entry:api/handler.go:Handle" {
+		t.Fatalf("S3 entry-point candidate = %+v", candidates[0])
+	}
+	if candidates[1].Phase != audit.PhaseDetect || len(candidates[1].SinkKeys) != 1 ||
+		candidates[1].SinkKeys[0] != "sink:api/db.go:Query" {
+		t.Fatalf("S4 sink candidate = %+v", candidates[1])
+	}
+}
+
+func TestAuditPlanCoverageRowsIncludesPlannedEntryPoints(t *testing.T) {
+	plan := audit.Plan{
+		Depth: audit.DepthDeep, Languages: []string{"go"},
+		PlannedCWEs: map[string][]string{"go": {"CWE-89"}},
+		EntryPoints: []string{"api.Handle", "worker.Run"},
+	}
+	rows := auditPlanCoverageRows(91, plan, nil, "codegraph")
+	entries := make([]db.AuditCoverage, 0, 2)
+	for _, row := range rows {
+		if row.Kind == audit.CoverageKindEntryPoint {
+			entries = append(entries, row)
+		}
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entry-point rows = %+v, want 2", entries)
+	}
+	for _, row := range entries {
+		if row.SessionID != 91 || row.Round != 1 || row.Language != "go" ||
+			row.Status != audit.CoverageStatusPlanned || row.Symbol == "" ||
+			row.SinkKey != "entry:"+row.Symbol {
+			t.Fatalf("planned entry-point row = %+v", row)
+		}
+	}
+	if entries[0].Symbol != "api.Handle" || entries[1].Symbol != "worker.Run" {
+		t.Fatalf("entry-point order = [%s %s]", entries[0].Symbol, entries[1].Symbol)
+	}
+}
+
+func TestAuditGatesIncludeHypothesisAndEngineDiscipline(t *testing.T) {
+	plan := audit.Plan{Depth: audit.DepthDeep}
+	attempts, err := json.Marshal(make([]map[string]any, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engineRecord := auditEnginesRecord{
+		Configured: map[string]string{audit.EngineCodeGraph: "required"},
+		Capabilities: map[string]engines.Capability{
+			audit.EngineCodeGraph: {Available: false, Reason: "not installed"},
+		},
+	}
+	gates := auditGates(
+		plan, nil, nil,
+		[]db.AuditHypothesis{{Status: "testing", Attempts: attempts}},
+		0,
+		[]db.AuditEngineJob{{Engine: audit.EngineCodeGraph, Status: "failed"}},
+		engineRecord,
+	)
+	if gate := gates["hypothesis"]; gate.Passed {
+		t.Fatalf("Gate-H passed for a testing hypothesis at attempt limit: %+v", gate)
+	}
+	if gate := gates["engine"]; gate.Passed {
+		t.Fatalf("Gate-Engine passed with required engine missing and failed job: %+v", gate)
+	}
+
+	engineRecord.Capabilities[audit.EngineCodeGraph] = engines.Capability{Available: true}
+	gates = auditGates(plan, nil, nil, nil, 0, nil, engineRecord)
+	if gate := gates["hypothesis"]; !gate.Passed {
+		t.Fatalf("Gate-H failed without hypotheses: %+v", gate)
+	}
+	if gate := gates["engine"]; !gate.Passed {
+		t.Fatalf("Gate-Engine failed with required engine ready: %+v", gate)
+	}
+
+	healthy := make([]db.AuditEngineJob, 0, 10)
+	for i := 0; i < 8; i++ {
+		healthy = append(healthy, db.AuditEngineJob{Engine: audit.EngineCodeGraph, Status: "done"})
+	}
+	atThreshold := append([]db.AuditEngineJob(nil), healthy...)
+	atThreshold = append(atThreshold,
+		db.AuditEngineJob{Engine: audit.EngineCodeGraph, Status: "failed"},
+		db.AuditEngineJob{Engine: audit.EngineCodeGraph, Status: "failed"},
+	)
+	gates = auditGates(audit.Plan{Depth: audit.DepthDeep}, nil, nil, nil, 0, atThreshold, engineRecord)
+	if gate := gates["engine"]; !gate.Passed {
+		t.Fatalf("Gate-Engine failed at the 0.80 success threshold: %+v", gate)
+	}
+
+	belowThreshold := append([]db.AuditEngineJob(nil), healthy[:7]...)
+	belowThreshold = append(belowThreshold,
+		db.AuditEngineJob{Engine: audit.EngineCodeGraph, Status: "failed"},
+		db.AuditEngineJob{Engine: audit.EngineCodeGraph, Status: "failed"},
+		db.AuditEngineJob{Engine: audit.EngineCodeGraph, Status: "failed"},
+	)
+	gates = auditGates(audit.Plan{Depth: audit.DepthDeep}, nil, nil, nil, 0, belowThreshold, engineRecord)
+	gate := gates["engine"]
+	if gate.Passed {
+		t.Fatalf("Gate-Engine passed below the 0.80 success threshold: %+v", gate)
+	}
+	details, _ := gate.Details["success_rate"].(float64)
+	if details < 0.69 || details > 0.71 {
+		t.Fatalf("Gate-Engine success rate = %v, want 0.70", gate.Details["success_rate"])
+	}
+	if outcome := auditEngineGateOutcome(atThreshold); outcome != "pass" {
+		t.Fatalf("round Gate-Engine outcome at threshold = %q, want pass", outcome)
+	}
+	if outcome := auditEngineGateOutcome(belowThreshold); outcome != "degraded" {
+		t.Fatalf("round Gate-Engine outcome below threshold = %q, want degraded", outcome)
+	}
+}
+
+func TestAuditGatesScoreHypothesisQualityAndPivot(t *testing.T) {
+	plan := audit.Plan{Depth: audit.DepthDeep}
+	engineRecord := auditEnginesRecord{}
+	oneAttempt := json.RawMessage(`[{"action":"attempt","outcome":"failed"}]`)
+
+	gates := auditGates(plan, nil, nil, nil, 0, nil, engineRecord)
+	gate := gates["hypothesis"]
+	if !gate.Passed || gate.Details["score"] == nil {
+		t.Fatalf("Gate-H without findings/hypotheses should pass with a score: %+v", gate)
+	}
+
+	gates = auditGates(plan, nil, nil, nil, 2, nil, engineRecord)
+	gate = gates["hypothesis"]
+	if gate.Passed {
+		t.Fatalf("Gate-H passed with findings but no hypotheses: %+v", gate)
+	}
+	if !strings.Contains(gate.Reason, "findings_without_hypotheses") {
+		t.Fatalf("Gate-H reason lacks findings violation: %+v", gate)
+	}
+
+	refuted := []db.AuditHypothesis{
+		{HypothesisKey: "one", Status: "refuted", Attempts: oneAttempt},
+		{HypothesisKey: "two", Status: "refuted", Attempts: oneAttempt},
+		{HypothesisKey: "three", Status: "refuted", Attempts: oneAttempt},
+	}
+	gates = auditGates(plan, nil, nil, refuted, 3, nil, engineRecord)
+	gate = gates["hypothesis"]
+	if gate.Passed || !strings.Contains(gate.Reason, "pivot_gap") {
+		t.Fatalf("Gate-H should fail after three refuted hypotheses without a pivot: %+v", gate)
+	}
+
+	pivoted := append(append([]db.AuditHypothesis(nil), refuted...),
+		db.AuditHypothesis{HypothesisKey: "new-direction", Status: "confirmed", Attempts: oneAttempt},
+	)
+	gates = auditGates(plan, nil, nil, pivoted, 3, nil, engineRecord)
+	gate = gates["hypothesis"]
+	if !gate.Passed {
+		t.Fatalf("Gate-H failed after a pivot: %+v", gate)
+	}
+	score, _ := gate.Details["score"].(float64)
+	if score < 62 || score > 63 {
+		t.Fatalf("Gate-H score = %v, want 62.5 (warning below 70)", gate.Details["score"])
+	}
+	if warning, _ := gate.Details["warning"].(bool); !warning {
+		t.Fatalf("Gate-H should warn below score 70: %+v", gate)
+	}
+	if outcome := auditHypothesisRoundOutcome(gate); outcome != "warn" {
+		t.Fatalf("round Gate-H outcome = %q, want warn", outcome)
 	}
 }
 
@@ -380,5 +616,107 @@ func TestBuildAuditProgressIncludesVerificationCandidates(t *testing.T) {
 	}
 	if out.ReportURL != "" {
 		t.Fatalf("report_url must be empty before completion: %q", out.ReportURL)
+	}
+}
+
+func TestBuildAuditProgressIncludesEngineVisibility(t *testing.T) {
+	session := &db.AuditSession{
+		ID: 1, TaskID: 2, Status: db.AuditStatusRunning, Round: 1, MaxRounds: 1,
+		Depth: audit.DepthQuick, Languages: []string{"go"},
+		Engines: json.RawMessage(`{
+			"intent_analysis": {
+				"recognition_source": "fallback",
+				"model": "test-model",
+				"prompt_version": "v1",
+				"raw_output_hash": "raw-hash",
+				"repair_attempts": 1,
+				"fallback": true,
+				"error": "provider timeout",
+				"query_gaps": ["LLM 意图识别失败，已回退确定性 sink 意图"]
+			},
+			"gaps": ["CodeQL unavailable"]
+		}`),
+	}
+	intentID := int64(11)
+	raw, err := buildAuditProgress(auditProgressInput{
+		Session: session,
+		Plan:    audit.Plan{Depth: audit.DepthQuick, Languages: []string{"go"}, PlannedCWEs: map[string][]string{"go": nil}},
+		Engines: []db.AuditEngineJob{{
+			ID: 7, IntentID: &intentID, Engine: "codeql", JobKind: "run",
+			QueryHash: "query-hash", Status: "done", ResultCount: 3, DurationMS: 1250,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		EngineStatus struct {
+			IntentAnalysis *auditIntentAnalysisRecord            `json:"intent_analysis"`
+			JobCounts      map[string]auditReportEngineJobCounts `json:"job_counts"`
+			Gaps           []string                              `json:"gaps"`
+		} `json:"engine_status"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	analysis := out.EngineStatus.IntentAnalysis
+	if analysis == nil {
+		t.Fatal("engine_status.intent_analysis is missing")
+	}
+	if analysis.RecognitionSource != "fallback" || analysis.Model != "test-model" ||
+		analysis.PromptVersion != "v1" || analysis.RawOutputHash != "raw-hash" ||
+		analysis.RepairAttempts != 1 || !analysis.Fallback ||
+		len(analysis.QueryGaps) != 1 {
+		t.Fatalf("intent analysis = %+v", analysis)
+	}
+	if out.EngineStatus.JobCounts["codeql"].Done != 1 {
+		t.Fatalf("job counts = %+v", out.EngineStatus.JobCounts)
+	}
+	if len(out.EngineStatus.Gaps) != 1 || out.EngineStatus.Gaps[0] != "CodeQL unavailable" {
+		t.Fatalf("engine gaps = %+v", out.EngineStatus.Gaps)
+	}
+}
+
+func TestBuildAuditProgressIncludesCoverageDetail(t *testing.T) {
+	session := &db.AuditSession{
+		ID: 1, TaskID: 2, Status: db.AuditStatusRunning, Round: 1, MaxRounds: 1,
+		Depth: audit.DepthQuick, Languages: []string{"go"},
+	}
+	plan := audit.Plan{Depth: audit.DepthQuick, Languages: []string{"go"}, PlannedCWEs: map[string][]string{"go": {"CWE-79"}}}
+	rows := []db.AuditCoverage{
+		{Kind: audit.CoverageKindCWE, Language: "go", CWE: "CWE-89", SinkKey: "cwe:go:CWE-89", Status: audit.CoverageStatusScanned},
+		{Kind: audit.CoverageKindCWE, Language: "go", CWE: "CWE-79", SinkKey: "cwe:go:CWE-79", Status: audit.CoverageStatusMissed, Reason: "not reached"},
+		{Kind: audit.CoverageKindSinkSite, Language: "go", CWE: "CWE-79", Module: "internal/pay", Path: "internal/pay/db.go", Line: 42, SinkKey: "sink:db", Status: audit.CoverageStatusPlanned},
+		{Kind: audit.CoverageKindSinkSite, Language: "go", CWE: "CWE-79", Module: "internal/pay", Path: "internal/pay/exempt.go", Line: 8, SinkKey: "sink:exempt", Status: audit.CoverageStatusExempt, Reason: "not approved"},
+	}
+	raw, err := buildAuditProgress(auditProgressInput{Session: session, Plan: plan, CoverageRows: rows})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		CoverageDetail struct {
+			Rows          []auditReportGapRow `json:"rows"`
+			UncoveredCWEs []string            `json:"uncovered_cwes"`
+		} `json:"coverage_detail"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.CoverageDetail.Rows) != 3 {
+		t.Fatalf("coverage detail rows = %+v", out.CoverageDetail.Rows)
+	}
+	if out.CoverageDetail.Rows[0].Status != audit.CoverageStatusMissed ||
+		out.CoverageDetail.Rows[0].Kind != audit.CoverageKindCWE ||
+		out.CoverageDetail.Rows[0].CWE != "CWE-79" {
+		t.Fatalf("first coverage row = %+v", out.CoverageDetail.Rows[0])
+	}
+	if out.CoverageDetail.Rows[1].Path != "internal/pay/db.go" || out.CoverageDetail.Rows[1].Line != 42 {
+		t.Fatalf("second coverage row = %+v", out.CoverageDetail.Rows[1])
+	}
+	if out.CoverageDetail.Rows[2].Status != audit.CoverageStatusExempt || out.CoverageDetail.Rows[2].Reason != "not approved" {
+		t.Fatalf("third coverage row = %+v", out.CoverageDetail.Rows[2])
+	}
+	if len(out.CoverageDetail.UncoveredCWEs) != 1 || out.CoverageDetail.UncoveredCWEs[0] != "go|CWE-79" {
+		t.Fatalf("uncovered cwes = %+v", out.CoverageDetail.UncoveredCWEs)
 	}
 }

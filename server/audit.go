@@ -89,6 +89,21 @@ func decodeAuditConfig(raw json.RawMessage) (*audit.Config, error) {
 	return &cfg, nil
 }
 
+func taskWorkerConfig(worker *audit.WorkerConfig) (json.RawMessage, error) {
+	if worker == nil {
+		return nil, nil
+	}
+	normalized := audit.NormalizeWorkerConfig(worker)
+	if err := audit.ValidateWorkerConfig(normalized); err != nil {
+		return nil, fmt.Errorf("worker 配置无效: %w", err)
+	}
+	data, err := json.Marshal(normalized)
+	if err != nil {
+		return nil, fmt.Errorf("序列化 worker 配置失败: %w", err)
+	}
+	return data, nil
+}
+
 // auditConfigIsEmpty reports whether raw is an absent/null/empty JSON object.
 // Non-object JSON is rejected.
 func auditConfigIsEmpty(raw json.RawMessage) (bool, error) {

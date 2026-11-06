@@ -120,7 +120,10 @@ func TestRenderAuditReport(t *testing.T) {
 		{ID: 2, Engine: "joern", Status: "done", ResultCount: 2},
 	}
 	rounds := []db.AuditRound{{Round: 1, NewFindings: 5, NewConfirmed: 1, NewCandidate: 2, TotalFindings: 5, Decision: "forced converge"}}
-	gates := auditGates(plan, auditPhaseStatuses(phases), auditCoverageRows(rows))
+	gates := auditGates(
+		plan, auditPhaseStatuses(phases), auditCoverageRows(rows),
+		hypotheses, len(findings), engineJobs, parseAuditEnginesRecord(session.Engines),
+	)
 	in := auditReportInput{
 		Task: task, Session: session, Plan: plan, Phases: phases, CoverageRows: rows,
 		Findings: findings, Rounds: rounds, Hypotheses: hypotheses, EngineJobs: engineJobs,
@@ -242,11 +245,14 @@ func TestRenderAuditReport(t *testing.T) {
 	if !report.Engines.QueryRecordsAvailable {
 		t.Fatal("engine query records should be available when jobs exist")
 	}
-	if len(report.Gates) != 3 || !report.Gates["phase"].Passed {
+	if len(report.Gates) != 5 || !report.Gates["phase"].Passed {
 		t.Fatalf("gates = %+v", report.Gates)
 	}
 	if report.Gates["coverage"].Passed {
 		t.Fatal("coverage gate should fail for missed sink sites at deep depth")
+	}
+	if report.Gates["hypothesis"].Name != "Gate-H" || report.Gates["engine"].Name != "Gate-Engine" {
+		t.Fatalf("deep-chain gates missing from report: %+v", report.Gates)
 	}
 	if len(report.Phases) == 0 || report.Phases[3].Reason != "no_targets" {
 		t.Fatalf("phase skip reason lost: %+v", report.Phases)
@@ -285,6 +291,39 @@ func TestAuditReportEngineQueryRecordsUnavailable(t *testing.T) {
 	}
 	if strings.Contains(joined, "未产生任务记录") {
 		t.Fatalf("must not invent enabled-with-no-job gaps: %v", engines.Gaps)
+	}
+}
+
+func TestAuditReportRecordsIntentAnalysisProvenance(t *testing.T) {
+	session := &db.AuditSession{
+		Backend: "codegraph",
+		Engines: json.RawMessage(`{
+			"configured":{"codeql":"auto"},
+			"intent_analysis":{
+				"recognition_source":"llm",
+				"model":"test-model",
+				"prompt_version":"v1",
+				"raw_output_hash":"abc123",
+				"repair_attempts":1,
+				"intent_count":2,
+				"query_gaps":["template gap"]
+			},
+			"gaps":["engine gap"]
+		}`),
+	}
+	engines := buildAuditReportEngines(session, nil, nil)
+	analysis := engines.IntentAnalysis
+	if analysis == nil {
+		t.Fatalf("intent analysis was not parsed: %+v", engines)
+	}
+	if analysis.RecognitionSource != "llm" || analysis.Model != "test-model" ||
+		analysis.PromptVersion != "v1" || analysis.RawOutputHash != "abc123" ||
+		analysis.RepairAttempts != 1 || analysis.IntentCount != 2 {
+		t.Fatalf("intent analysis = %+v", analysis)
+	}
+	joined := strings.Join(engines.Gaps, "\n")
+	if !strings.Contains(joined, "template gap") || !strings.Contains(joined, "engine gap") {
+		t.Fatalf("intent analysis gap missing from engine gaps: %v", engines.Gaps)
 	}
 }
 

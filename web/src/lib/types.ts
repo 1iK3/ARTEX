@@ -10,6 +10,8 @@ export type AuditSourceType = "git" | "local" | "zip";
 export type AuditDepth = "quick" | "standard" | "deep";
 export type AuditCWEScope = "core" | "full" | "explicit";
 export type AuditEngineChoice = "required" | "auto" | "off";
+export type AuditWorkerBackend = "builtin" | "codex" | "opencode" | "claudecode" | "cursor" | "pi" | "custom";
+export type AuditWorkerMode = "static" | "privileged";
 
 // 创建代码审计任务时冻结在 tasks.audit_config 的配置。
 export interface AuditConfig {
@@ -29,10 +31,41 @@ export interface AuditConfig {
     joern?: Exclude<AuditEngineChoice, "required">;
   };
   budgets?: Record<string, number>;
+  worker?: AuditWorkerConfig;
   include_tests?: boolean;
   include_vendor?: boolean;
   // 旧模板/扩展字段可能带更多键，保持后向兼容。
   [key: string]: unknown;
+}
+
+export interface AuditWorkerConfig {
+  backend: AuditWorkerBackend;
+  mode: AuditWorkerMode;
+  command?: string;
+  args?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  timeout_seconds?: number;
+  auto_confirm?: boolean;
+}
+
+export interface AuditWorkerBackendOption {
+  backend: AuditWorkerBackend;
+  label: string;
+  description?: string;
+  external: boolean;
+  requires_command: boolean;
+  available?: boolean;
+  modes: AuditWorkerMode[];
+  suggested_mode: AuditWorkerMode;
+  suggested_command?: string;
+  suggested_args?: string[];
+  suggested_privileged_args?: string[];
+}
+
+export interface AuditWorkerBackends {
+  default_backend?: AuditWorkerBackend;
+  backends: AuditWorkerBackendOption[];
 }
 
 export interface AuditEngineCapability {
@@ -68,6 +101,7 @@ export interface Task {
   status: TaskStatus;
   task_mode?: TaskMode; // 空/缺省=pentest（老任务）
   audit_config?: AuditConfig; // 仅 code_audit；创建时冻结的配置
+  worker_config?: AuditWorkerConfig; // 任务级外部 worker 配置（pentest/code_audit 均可用）
   created_at: string;
   created_unix?: number; // created_at as unix seconds (run-duration calc)
   completed_at?: string; // RFC3339 finish time (done/failed); "" if unfinished
@@ -533,6 +567,44 @@ export interface AuditEngineState {
   path?: string;
 }
 
+export interface AuditEngineJobCounts {
+  total?: number;
+  pending?: number;
+  running?: number;
+  done?: number;
+  failed?: number;
+  skipped?: number;
+  canceled?: number;
+}
+
+export interface AuditEngineCapabilityStatus {
+  state?: string;
+  available?: boolean;
+  version?: string;
+  reason?: string;
+  languages?: string[];
+  build_mode_none?: boolean;
+}
+
+export interface AuditIntentAnalysis {
+  recognition_source?: string;
+  model?: string;
+  prompt_version?: string;
+  raw_output_hash?: string;
+  repair_attempts?: number;
+  intent_count?: number;
+  fallback?: boolean;
+  error?: string;
+  query_gaps?: string[];
+}
+
+export interface AuditEngineStatus {
+  capabilities?: Record<string, AuditEngineCapabilityStatus>;
+  job_counts?: Record<string, AuditEngineJobCounts>;
+  intent_analysis?: AuditIntentAnalysis;
+  warnings?: string[];
+  gaps?: string[];
+}
 export interface AuditPhase {
   id?: number;
   session_id?: number;
@@ -581,6 +653,19 @@ export interface AuditCandidate {
   priority?: number;
   severity?: string;
   scope?: Record<string, unknown>;
+}
+
+export type AuditFindingVerificationStatus = "confirmed" | "refuted" | "design_intent";
+
+export interface AuditFindingVerificationBatchInput {
+  finding_ids: number[];
+  verification: AuditFindingVerificationStatus;
+  evidence: string;
+}
+
+export interface AuditFindingVerificationBatchResult {
+  updated: number;
+  verification: AuditFindingVerificationStatus;
 }
 
 export interface AuditEngineJob {
@@ -650,12 +735,29 @@ export interface AuditSessionSummary {
   completed_at?: string;
 }
 
+export interface AuditCoverageGapRow {
+  status?: string;
+  kind?: string;
+  language?: string;
+  cwe?: string;
+  module?: string;
+  path?: string;
+  line?: number;
+  sink_key?: string;
+  reason?: string;
+}
+
+export interface AuditCoverageDetail {
+  rows?: AuditCoverageGapRow[];
+  uncovered_cwes?: string[];
+}
 export interface AuditProgress {
   session?: AuditSessionSummary;
   phases?: AuditPhase[];
   coverage?: AuditCoverage;
   gates?: Record<string, AuditGate | string> | AuditGate[];
   engines?: AuditEngineJob[] | Record<string, AuditEngineState | string>;
+  engine_status?: AuditEngineStatus;
   candidates?: AuditCandidate[];
   findings?: {
     total?: number;
@@ -684,7 +786,7 @@ export interface AuditProgress {
   report_url?: string;
   source_label?: string;
   source?: Record<string, unknown>;
-  coverage_detail?: Record<string, unknown>;
+  coverage_detail?: AuditCoverageDetail;
   [key: string]: unknown;
 }
 

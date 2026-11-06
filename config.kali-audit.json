@@ -1,0 +1,6 @@
+{
+  "database": {
+    "dsn": "postgres://artex:artex@127.0.0.1:5432/artex?sslmode=disable"
+  },
+  "skill_dir": "/app/skills"
+}

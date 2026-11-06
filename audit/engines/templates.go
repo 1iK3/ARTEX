@@ -16,22 +16,19 @@ import (
 // templates use the same engine APIs but have not been exercised against a
 // pinned frontend/pack; unsupported engine/language/kind combinations are
 // reported as capability gaps rather than guessed at. The Joern v2 templates
-// model sources and sinks only; sanitizers and path scope are carried in
-// QuerySpec.Params but not yet applied in CPGQL.
+// model sources, sinks, sanitizers, and path scope.
 
 // Template identifiers. Each identifier encodes engine, template language, and
 // query kind so a QuerySpec is self-describing.
 const (
-	TemplateCodeQLJavaTaint  = "codeql/java/taint-v2"
-	TemplateCodeQLJavaSink   = "codeql/java/sink-v2"
-	TemplateCodeGraphExplore = "codegraph/explore-v1"
+	TemplateCodeQLJavaTaint       = "codeql/java/taint-v2"
+	TemplateCodeQLJavaSink        = "codeql/java/sink-v2"
+	TemplateCodeQLPythonTaint     = "codeql/python/taint-v2"
+	TemplateCodeQLPythonSink      = "codeql/python/sink-v2"
+	TemplateCodeQLJavaScriptTaint = "codeql/javascript/taint-v2"
+	TemplateCodeQLJavaScriptSink  = "codeql/javascript/sink-v2"
+	TemplateCodeGraphExplore      = "codegraph/explore-v1"
 )
-
-// CodeQL Python, JavaScript, and TypeScript templates are intentionally not
-// registered. The local CodeQL installation has only the Java library pack, and
-// pack downloads are incompatible with CLI 2.25.5's manifest parser; generating
-// unverified QL for those languages would violate the template policy. Render
-// reports ErrUnsupported so the manager records an explicit capability gap.
 
 const (
 	maxTemplateSymbols      = 64
@@ -68,6 +65,22 @@ func init() {
 	addTemplate(templateSpec{
 		ID: TemplateCodeQLJavaSink, Engine: EngineCodeQL, Language: "java",
 		Kind: QueryKindSink, Format: FormatSARIF, render: renderCodeQLJavaSink,
+	})
+	addTemplate(templateSpec{
+		ID: TemplateCodeQLPythonTaint, Engine: EngineCodeQL, Language: "python",
+		Kind: QueryKindTaint, Format: FormatSARIF, render: renderCodeQLPythonTaint,
+	})
+	addTemplate(templateSpec{
+		ID: TemplateCodeQLPythonSink, Engine: EngineCodeQL, Language: "python",
+		Kind: QueryKindSink, Format: FormatSARIF, render: renderCodeQLPythonSink,
+	})
+	addTemplate(templateSpec{
+		ID: TemplateCodeQLJavaScriptTaint, Engine: EngineCodeQL, Language: "javascript",
+		Kind: QueryKindTaint, Format: FormatSARIF, render: renderCodeQLJavaScriptTaint,
+	})
+	addTemplate(templateSpec{
+		ID: TemplateCodeQLJavaScriptSink, Engine: EngineCodeQL, Language: "javascript",
+		Kind: QueryKindSink, Format: FormatSARIF, render: renderCodeQLJavaScriptSink,
 	})
 	for _, language := range []string{"java", "python", "javascript", "go", "c", "cpp"} {
 		for _, kind := range []string{QueryKindTaint, QueryKindSink} {
@@ -210,8 +223,12 @@ select call, {{.Message}}
 `
 
 var (
-	codeQLJavaTaintTmpl = template.Must(template.New("codeql-java-taint").Parse(codeQLJavaTaintSource))
-	codeQLJavaSinkTmpl  = template.Must(template.New("codeql-java-sink").Parse(codeQLJavaSinkSource))
+	codeQLJavaTaintTmpl       = template.Must(template.New("codeql-java-taint").Parse(codeQLJavaTaintSource))
+	codeQLJavaSinkTmpl        = template.Must(template.New("codeql-java-sink").Parse(codeQLJavaSinkSource))
+	codeQLPythonTaintTmpl     = template.Must(template.New("codeql-python-taint").Parse(codeQLPythonTaintSource))
+	codeQLPythonSinkTmpl      = template.Must(template.New("codeql-python-sink").Parse(codeQLPythonSinkSource))
+	codeQLJavaScriptTaintTmpl = template.Must(template.New("codeql-javascript-taint").Parse(codeQLJavaScriptTaintSource))
+	codeQLJavaScriptSinkTmpl  = template.Must(template.New("codeql-javascript-sink").Parse(codeQLJavaScriptSinkSource))
 )
 
 type codeQLTemplateData struct {
@@ -254,6 +271,164 @@ func renderCodeQLJavaSink(in templateInput) (string, error) {
 	return executeTextTemplate(codeQLJavaSinkTmpl, data)
 }
 
+const codeQLPythonTaintSource = `/**
+ * @name Artex generated Python taint query
+ * @kind path-problem
+ * @problem.severity warning
+ * @id artex/generated/taint/{{.SpecID}}
+ */
+import python
+import semmle.python.dataflow.new.DataFlow
+import semmle.python.dataflow.new.TaintTracking
+
+module ArtexConfig implements DataFlow::ConfigSig {
+  predicate isSource(DataFlow::Node source) {
+    exists(Call call |
+      (call.getFunc().(Name).getId() in {{.SourceList}} or
+       call.getFunc().(Attribute).getName() in {{.SourceList}}) and
+      source.asExpr() = call
+    )
+  }
+
+  predicate isSink(DataFlow::Node sink) {
+    exists(Call call |
+      (call.getFunc().(Name).getId() in {{.SinkList}} or
+       call.getFunc().(Attribute).getName() in {{.SinkList}}) and
+      sink.asExpr() = call.getArg(0)
+    )
+  }
+{{.BarrierPredicate}}
+}
+
+module ArtexFlow = TaintTracking::Global<ArtexConfig>;
+import ArtexFlow::PathGraph
+
+from ArtexFlow::PathNode source, ArtexFlow::PathNode sink
+where ArtexFlow::flowPath(source, sink)
+select sink.getNode(), source, sink, {{.Message}}
+`
+
+const codeQLPythonSinkSource = `/**
+ * @name Artex generated Python sink query
+ * @kind problem
+ * @problem.severity warning
+ * @id artex/generated/sink/{{.SpecID}}
+ */
+import python
+
+from Call call
+where
+  call.getFunc().(Name).getId() in {{.SinkList}} or
+  call.getFunc().(Attribute).getName() in {{.SinkList}}
+select call, {{.Message}}
+`
+
+const codeQLJavaScriptTaintSource = `/**
+ * @name Artex generated JavaScript taint query
+ * @kind path-problem
+ * @problem.severity warning
+ * @id artex/generated/taint/{{.SpecID}}
+ */
+import javascript
+import semmle.javascript.dataflow.DataFlow
+import semmle.javascript.dataflow.TaintTracking
+
+module ArtexConfig implements DataFlow::ConfigSig {
+  predicate isSource(DataFlow::Node source) {
+    exists(InvokeExpr call |
+      call.getCalleeName() in {{.SourceList}} and
+      source.asExpr() = call
+    )
+  }
+
+  predicate isSink(DataFlow::Node sink) {
+    exists(InvokeExpr call |
+      call.getCalleeName() in {{.SinkList}} and
+      sink.asExpr() = call.getArgument(0)
+    )
+  }
+{{.BarrierPredicate}}
+}
+
+module ArtexFlow = TaintTracking::Global<ArtexConfig>;
+import ArtexFlow::PathGraph
+
+from ArtexFlow::PathNode source, ArtexFlow::PathNode sink
+where ArtexFlow::flowPath(source, sink)
+select sink.getNode(), source, sink, {{.Message}}
+`
+
+const codeQLJavaScriptSinkSource = `/**
+ * @name Artex generated JavaScript sink query
+ * @kind problem
+ * @problem.severity warning
+ * @id artex/generated/sink/{{.SpecID}}
+ */
+import javascript
+
+from InvokeExpr call
+where call.getCalleeName() in {{.SinkList}}
+select call, {{.Message}}
+`
+
+func renderCodeQLPythonTaint(in templateInput) (string, error) {
+	sources := methodSymbols(in.Intent.Sources)
+	sinks := methodSymbols(in.Intent.Sinks)
+	if len(sinks) == 0 {
+		return "", fmt.Errorf("%w: CodeQL Python taint template needs at least one method-call sink", ErrInvalidQuery)
+	}
+	if len(sources) == 0 {
+		return "", fmt.Errorf("%w: CodeQL Python taint template needs at least one method-call source", ErrInvalidQuery)
+	}
+	data := codeQLTemplateData{
+		SpecID: in.SpecID, SourceList: qlStringList(sources), SinkList: qlStringList(sinks),
+		BarrierPredicate: codeQLPythonBarrierPredicate(methodSymbols(in.Intent.Sanitizers)),
+		Message:          qlString(templateMessage(in.Intent)),
+	}
+	return executeTextTemplate(codeQLPythonTaintTmpl, data)
+}
+
+func renderCodeQLPythonSink(in templateInput) (string, error) {
+	sinks := methodSymbols(in.Intent.Sinks)
+	if len(sinks) == 0 {
+		return "", fmt.Errorf("%w: CodeQL Python sink template needs at least one method-call sink", ErrInvalidQuery)
+	}
+	data := codeQLTemplateData{
+		SpecID: in.SpecID, SinkList: qlStringList(sinks),
+		Message: qlString(templateMessage(in.Intent)),
+	}
+	return executeTextTemplate(codeQLPythonSinkTmpl, data)
+}
+
+func renderCodeQLJavaScriptTaint(in templateInput) (string, error) {
+	sources := methodSymbols(in.Intent.Sources)
+	sinks := methodSymbols(in.Intent.Sinks)
+	if len(sinks) == 0 {
+		return "", fmt.Errorf("%w: CodeQL JavaScript taint template needs at least one method-call sink", ErrInvalidQuery)
+	}
+	if len(sources) == 0 {
+		return "", fmt.Errorf("%w: CodeQL JavaScript taint template needs at least one method-call source", ErrInvalidQuery)
+	}
+	data := codeQLTemplateData{
+		SpecID: in.SpecID, SourceList: qlStringList(sources), SinkList: qlStringList(sinks),
+		BarrierPredicate: codeQLJavaScriptBarrierPredicate(methodSymbols(in.Intent.Sanitizers)),
+		Message:          qlString(templateMessage(in.Intent)),
+	}
+	return executeTextTemplate(codeQLJavaScriptTaintTmpl, data)
+}
+
+func renderCodeQLJavaScriptSink(in templateInput) (string, error) {
+	sinks := methodSymbols(in.Intent.Sinks)
+	if len(sinks) == 0 {
+		return "", fmt.Errorf("%w: CodeQL JavaScript sink template needs at least one method-call sink", ErrInvalidQuery)
+	}
+	data := codeQLTemplateData{
+		SpecID: in.SpecID, SinkList: qlStringList(sinks),
+		Message: qlString(templateMessage(in.Intent)),
+	}
+	return executeTextTemplate(codeQLJavaScriptSinkTmpl, data)
+}
+
 func executeTextTemplate(tmpl *template.Template, data any) (string, error) {
 	var out strings.Builder
 	if err := tmpl.Execute(&out, data); err != nil {
@@ -270,6 +445,31 @@ func codeQLBarrierPredicate(sanitizers []string) string {
 		"    exists(MethodCall call |\n" +
 		"      call.getMethod().getName() in " + qlStringList(sanitizers) + " and\n" +
 		"      (node.asExpr() = call.getAnArgument() or node.asExpr() = call)\n" +
+		"    )\n" +
+		"  }\n"
+}
+
+func codeQLPythonBarrierPredicate(sanitizers []string) string {
+	if len(sanitizers) == 0 {
+		return ""
+	}
+	return "\n  predicate isBarrier(DataFlow::Node node) {\n" +
+		"    exists(Call call |\n" +
+		"      (call.getFunc().(Name).getId() in " + qlStringList(sanitizers) + " or\n" +
+		"       call.getFunc().(Attribute).getName() in " + qlStringList(sanitizers) + ") and\n" +
+		"      (node.asExpr() = call or node.asExpr() = call.getArg(0))\n" +
+		"    )\n" +
+		"  }\n"
+}
+
+func codeQLJavaScriptBarrierPredicate(sanitizers []string) string {
+	if len(sanitizers) == 0 {
+		return ""
+	}
+	return "\n  predicate isBarrier(DataFlow::Node node) {\n" +
+		"    exists(InvokeExpr call |\n" +
+		"      call.getCalleeName() in " + qlStringList(sanitizers) + " and\n" +
+		"      (node.asExpr() = call or node.asExpr() = call.getAnArgument())\n" +
 		"    )\n" +
 		"  }\n"
 }
@@ -302,10 +502,22 @@ func summarizeSymbols(symbols []string, limit int) string {
 
 const joernTaintSource = `// Artex generated CPGQL taint query ({{.Template}}, template v2, verified on Java with Joern 4.0.535).
 // The fixed wrapper loads the CPG and serializes artexRows as marker-prefixed JSON.
-val artexSources = cpg.call.filter(c => c.name.matches({{.SourceRegex}})).l
-val artexSinks = cpg.call.filter(c => c.name.matches({{.SinkRegex}})).l
-val artexRows: List[ujson.Value] = artexSinks.flatMap { sinkCall =>
-  Iterator.single(sinkCall).reachableByFlows(artexSources).map { path =>
+val artexScopePaths = {{.ScopePaths}}
+val artexExcludePaths = {{.ExcludePaths}}
+val artexInScope = (call: io.shiftleft.codepropertygraph.generated.nodes.Call) => {
+  val path = call.file.name.headOption.getOrElse("").replace('\\', '/')
+  (artexScopePaths.isEmpty || artexScopePaths.exists(scope => path.contains(scope))) &&
+  (artexExcludePaths.isEmpty || !artexExcludePaths.exists(excluded => path.contains(excluded)))
+}
+val artexSources = cpg.call.filter(c => artexInScope(c) && c.name.matches({{.SourceRegex}})).l
+val artexSinks = cpg.call.filter(c => artexInScope(c) && c.name.matches({{.SinkRegex}})).l
+{{if .HasSanitizers}}val artexSanitizers = {{.SanitizerRegex}}
+{{end}}val artexRows: List[ujson.Value] = artexSinks.flatMap { sinkCall =>
+  val artexSinkNodes = {{.SinkNodes}}
+  artexSinkNodes.flatMap { sinkNode =>
+  Iterator.single(sinkNode).reachableByFlows(artexSources).filterNot { path =>
+    {{if .HasSanitizers}}path.elements.exists(step => step.code.matches(artexSanitizers)){{else}}false{{end}}
+  }.map { path =>
     val steps = path.elements
     val artexTrace = steps.map { step =>
       ujson.Obj(
@@ -325,12 +537,20 @@ val artexRows: List[ujson.Value] = artexSinks.flatMap { sinkCall =>
       "trace" -> ujson.Arr.from(artexTrace)
     )
   }
+  }
 }.toList
 `
 
 const joernSinkSource = `// Artex generated CPGQL sink query ({{.Template}}, template v2, verified on Java with Joern 4.0.535).
 // The fixed wrapper loads the CPG and serializes artexRows as marker-prefixed JSON.
-val artexSinks = cpg.call.filter(c => c.name.matches({{.SinkRegex}})).l
+val artexScopePaths = {{.ScopePaths}}
+val artexExcludePaths = {{.ExcludePaths}}
+val artexInScope = (call: io.shiftleft.codepropertygraph.generated.nodes.Call) => {
+  val path = call.file.name.headOption.getOrElse("").replace('\\', '/')
+  (artexScopePaths.isEmpty || artexScopePaths.exists(scope => path.contains(scope))) &&
+  (artexExcludePaths.isEmpty || !artexExcludePaths.exists(excluded => path.contains(excluded)))
+}
+val artexSinks = cpg.call.filter(c => artexInScope(c) && c.name.matches({{.SinkRegex}})).l
 val artexRows: List[ujson.Value] = artexSinks.map { call =>
   ujson.Obj(
     "file" -> ujson.Str(call.file.name.headOption.getOrElse("")),
@@ -351,11 +571,16 @@ var (
 )
 
 type joernTemplateData struct {
-	Template    string
-	SourceRegex string
-	SinkRegex   string
-	CWE         string
-	Message     string
+	Template       string
+	SourceRegex    string
+	SinkRegex      string
+	SinkNodes      string
+	SanitizerRegex string
+	HasSanitizers  bool
+	ScopePaths     string
+	ExcludePaths   string
+	CWE            string
+	Message        string
 }
 
 func renderJoernTaint(in templateInput) (string, error) {
@@ -367,14 +592,32 @@ func renderJoernTaint(in templateInput) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%w: Joern taint template has no usable sink pattern", ErrInvalidQuery)
 	}
+	sanitizerRegex, err := joernNameRegex(in.Intent.Sanitizers)
+	if err != nil && len(in.Intent.Sanitizers) > 0 {
+		return "", fmt.Errorf("%w: Joern taint template has no usable sanitizer pattern", ErrInvalidQuery)
+	}
 	data := joernTemplateData{
-		Template:    in.Template,
-		SourceRegex: scalaString(sourceRegex),
-		SinkRegex:   scalaString(sinkRegex),
-		CWE:         scalaString(in.Intent.CWE),
-		Message:     scalaString(templateMessage(in.Intent)),
+		Template:       in.Template,
+		SourceRegex:    scalaString(sourceRegex),
+		SinkRegex:      scalaString(sinkRegex),
+		SinkNodes:      joernSinkNodes(in.Intent.Language),
+		SanitizerRegex: scalaString(sanitizerRegex),
+		HasSanitizers:  len(in.Intent.Sanitizers) > 0,
+		ScopePaths:     scalaStringList(in.Intent.Scope.Paths),
+		ExcludePaths:   scalaStringList(in.Intent.Scope.Exclude),
+		CWE:            scalaString(in.Intent.CWE),
+		Message:        scalaString(templateMessage(in.Intent)),
 	}
 	return executeTextTemplate(joernTaintTmpl, data)
+}
+
+func joernSinkNodes(language string) string {
+	switch normalizeIntentLanguage(language) {
+	case audit.Python, audit.C, audit.Go:
+		return "sinkCall.argument"
+	default:
+		return "Iterator.single(sinkCall)"
+	}
 }
 
 func renderJoernSink(in templateInput) (string, error) {
@@ -383,10 +626,12 @@ func renderJoernSink(in templateInput) (string, error) {
 		return "", fmt.Errorf("%w: Joern sink template has no usable sink pattern", ErrInvalidQuery)
 	}
 	data := joernTemplateData{
-		Template:  in.Template,
-		SinkRegex: scalaString(sinkRegex),
-		CWE:       scalaString(in.Intent.CWE),
-		Message:   scalaString(templateMessage(in.Intent)),
+		Template:     in.Template,
+		SinkRegex:    scalaString(sinkRegex),
+		ScopePaths:   scalaStringList(in.Intent.Scope.Paths),
+		ExcludePaths: scalaStringList(in.Intent.Scope.Exclude),
+		CWE:          scalaString(in.Intent.CWE),
+		Message:      scalaString(templateMessage(in.Intent)),
 	}
 	return executeTextTemplate(joernSinkTmpl, data)
 }
@@ -440,6 +685,17 @@ func safeJoernRegex(raw string) bool {
 	return safeJoernRegexPattern.MatchString(raw)
 }
 
+func scalaStringList(values []string) string {
+	if len(values) == 0 {
+		return "List.empty[String]"
+	}
+	quoted := make([]string, 0, len(values))
+	for _, value := range values {
+		quoted = append(quoted, scalaString(value))
+	}
+	return "List(" + strings.Join(quoted, ", ") + ")"
+}
+
 // ---------------------------------------------------------------------------
 // CodeGraph template
 // ---------------------------------------------------------------------------
@@ -450,6 +706,9 @@ func renderCodeGraphQuery(in templateInput) (string, error) {
 	title := strings.TrimSpace(intent.Title)
 	if title == "" {
 		title = intent.CWE
+	}
+	if intent.QueryKind == QueryKindErrorContract || intent.QueryKind == QueryKindStateTransition || intent.QueryKind == QueryKindInvariant {
+		return renderSemanticCodeGraphQuery(intent, title)
 	}
 	fmt.Fprintf(&out, "Trace source to sink for %s in %s: %s.\n",
 		intent.CWE, intent.Language, oneLineText(title))
@@ -472,6 +731,37 @@ func renderCodeGraphQuery(in templateInput) (string, error) {
 		fmt.Fprintf(&out, "Modules: %s.\n", oneLineText(strings.Join(intent.Scope.Modules, ", ")))
 	}
 	fmt.Fprintf(&out, "Use codegraph_explore to trace source to sink and return exact file, line, and sink API evidence for %s.\n", intent.CWE)
+	return out.String(), nil
+}
+
+func renderSemanticCodeGraphQuery(intent DetectionIntent, title string) (string, error) {
+	var out strings.Builder
+	investigation := "语义审计"
+	switch intent.QueryKind {
+	case QueryKindErrorContract:
+		investigation = "错误契约审计"
+	case QueryKindStateTransition:
+		investigation = "状态迁移审计"
+	case QueryKindInvariant:
+		investigation = "不变式审计"
+	}
+	fmt.Fprintf(&out, "%s for %s in %s: %s.\n", investigation, intent.CWE, intent.Language, oneLineText(title))
+	if len(intent.Scope.Symbols) > 0 {
+		fmt.Fprintf(&out, "Scoped symbols: %s.\n", oneLineText(strings.Join(intent.Scope.Symbols, ", ")))
+	}
+	if len(intent.Scope.Paths) > 0 {
+		fmt.Fprintf(&out, "Scope paths: %s.\n", oneLineText(strings.Join(intent.Scope.Paths, ", ")))
+	}
+	if len(intent.Scope.Modules) > 0 {
+		fmt.Fprintf(&out, "Modules: %s.\n", oneLineText(strings.Join(intent.Scope.Modules, ", ")))
+	}
+	out.WriteString("调查清单：\n")
+	out.WriteString("1. 建立返回值/错误码 taxonomy，并区分永久错误与临时可恢复状态。\n")
+	out.WriteString("2. 使用 codegraph_explore 追踪所有调用方，并记录每个调用方对返回值/错误状态的契约。\n")
+	out.WriteString("3. 执行宏展开，识别宏隐藏的控制流、边界检查或缓冲写入。\n")
+	out.WriteString("4. 检查重试循环、固定大小缓冲、状态迁移和不变式是否可能同时成立。\n")
+	out.WriteString("5. 给出证明链：入口点、攻击者可控输入、状态/错误语义、调用方行为、越界或失控后果，并附精确文件、行号和符号证据。\n")
+	out.WriteString("6. 主动反证：寻找不可达路径、已存在的边界检查、状态恢复、错误终止或权限约束；无法反证时才保留候选。\n")
 	return out.String(), nil
 }
 

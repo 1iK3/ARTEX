@@ -61,9 +61,10 @@ type TaskDTO struct {
 	SourceTaskIDs      []string           `json:"source_task_ids"`
 	ArchiveBlockedBy   string             `json:"archive_blocked_by_task_id,omitempty"`
 	CompanyIDs         []int64            `json:"company_ids"`
-	CoverageEnabled    bool               `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定)
-	TaskMode           string             `json:"task_mode"`              // pentest | code_audit；老任务默认 pentest
-	AuditConfig        json.RawMessage    `json:"audit_config,omitempty"` // 仅 code_audit；创建时冻结的审计配置
+	CoverageEnabled    bool               `json:"coverage_enabled"`        // 资产覆盖度功能开关(创建时定)
+	TaskMode           string             `json:"task_mode"`               // pentest | code_audit；老任务默认 pentest
+	AuditConfig        json.RawMessage    `json:"audit_config,omitempty"`  // 仅 code_audit；创建时冻结的审计配置
+	WorkerConfig       json.RawMessage    `json:"worker_config,omitempty"` // 任务级外部 worker 配置；pentest/code_audit 均可使用
 }
 
 // FindingSeverityDTO 是任务列表里按严重度分档的漏洞计数（严重/高/中/低）。
@@ -147,6 +148,7 @@ func taskDTO(t *Task, status string) TaskDTO {
 		CoverageEnabled:    t.CoverageEnabled,
 		TaskMode:           mode,
 		AuditConfig:        auditConfig,
+		WorkerConfig:       append(json.RawMessage(nil), t.WorkerConfig...),
 	}
 }
 

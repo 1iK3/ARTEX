@@ -23,6 +23,17 @@ const maxQueryTextBytes = 1 << 20
 // template. Language/engine availability is additionally checked by the
 // manager using Probe capabilities.
 func Render(engine string, intent DetectionIntent) (QuerySpec, error) {
+	return render(engine, intent, "", "")
+}
+
+// RenderForSource renders with runtime engine/source identity. The identity is
+// part of the cache key so a binary upgrade or a new commit never reuses stale
+// query artifacts.
+func RenderForSource(engine string, intent DetectionIntent, engineVersion, commit string) (QuerySpec, error) {
+	return render(engine, intent, engineVersion, commit)
+}
+
+func render(engine string, intent DetectionIntent, engineVersion, commit string) (QuerySpec, error) {
 	normalizedEngine := normalizeEngineName(engine)
 	if normalizedEngine == "" {
 		return QuerySpec{}, fmt.Errorf("%w: unknown engine %q", ErrUnsupported, engine)
@@ -52,7 +63,10 @@ func Render(engine string, intent DetectionIntent) (QuerySpec, error) {
 		return QuerySpec{}, err
 	}
 	params := buildQueryParams(intent)
-	cacheKey := queryCacheKeyParts(normalizedEngine, intent.Language, intent.QueryKind, spec.ID, params)
+	engineVersion = strings.TrimSpace(engineVersion)
+	commit = strings.TrimSpace(commit)
+	irHash := IntentIRHash(intent)
+	cacheKey := queryCacheKeyParts(normalizedEngine, intent.Language, intent.QueryKind, spec.ID, params, engineVersion, commit, irHash, TemplateVersion)
 	specID := "qs-" + cacheKey[:16]
 
 	queryText, err := spec.render(templateInput{
@@ -73,6 +87,9 @@ func Render(engine string, intent DetectionIntent) (QuerySpec, error) {
 
 	provenance := map[string]any{
 		"template_version": TemplateVersion,
+		"ir_hash":          irHash,
+		"engine_version":   engineVersion,
+		"commit":           commit,
 		"generated_by":     "template",
 		"verified":         false,
 		"engine_language":  spec.Language,
@@ -84,18 +101,22 @@ func Render(engine string, intent DetectionIntent) (QuerySpec, error) {
 	}
 
 	return QuerySpec{
-		ID:             specID,
-		IntentID:       intent.ID,
-		Engine:         normalizedEngine,
-		Language:       intent.Language,
-		QueryKind:      intent.QueryKind,
-		Template:       spec.ID,
-		QueryText:      queryText,
-		QueryPath:      queryPathFor(normalizedEngine, specID),
-		ExpectedFormat: spec.Format,
-		GeneratedBy:    "template",
-		Params:         params,
-		Provenance:     provenance,
+		ID:              specID,
+		IntentID:        intent.ID,
+		Engine:          normalizedEngine,
+		Language:        intent.Language,
+		QueryKind:       intent.QueryKind,
+		Template:        spec.ID,
+		TemplateVersion: TemplateVersion,
+		EngineVersion:   engineVersion,
+		Commit:          commit,
+		IRHash:          irHash,
+		QueryText:       queryText,
+		QueryPath:       queryPathFor(normalizedEngine, specID),
+		ExpectedFormat:  spec.Format,
+		GeneratedBy:     "template",
+		Params:          params,
+		Provenance:      provenance,
 	}, nil
 }
 
@@ -279,10 +300,10 @@ func queryPathFor(engine, specID string) string {
 // sha256(engine|language|query_kind|template|canonical(params)). The
 // runtime-only ArtifactPath is deliberately excluded.
 func QueryCacheKey(q QuerySpec) string {
-	return queryCacheKeyParts(q.Engine, q.Language, q.QueryKind, q.Template, q.Params)
+	return queryCacheKeyParts(q.Engine, q.Language, q.QueryKind, q.Template, q.Params, q.EngineVersion, q.Commit, q.IRHash, q.TemplateVersion)
 }
 
-func queryCacheKeyParts(engine, language, queryKind, templateID string, params map[string]any) string {
+func queryCacheKeyParts(engine, language, queryKind, templateID string, params map[string]any, engineVersion, commit, irHash, templateVersion string) string {
 	normalizedEngine := normalizeEngineName(engine)
 	if normalizedEngine == "" {
 		normalizedEngine = strings.ToLower(strings.TrimSpace(engine))
@@ -291,21 +312,33 @@ func queryCacheKeyParts(engine, language, queryKind, templateID string, params m
 	language = normalizeIntentLanguage(language)
 	queryKind = strings.ToLower(strings.TrimSpace(queryKind))
 	templateID = strings.TrimSpace(templateID)
+	templateVersion = strings.TrimSpace(templateVersion)
+	if templateVersion == "" {
+		templateVersion = TemplateVersion
+	}
 	if params == nil {
 		params = map[string]any{}
 	}
 	material := struct {
-		Engine    string         `json:"engine"`
-		Language  string         `json:"language"`
-		QueryKind string         `json:"query_kind"`
-		Template  string         `json:"template"`
-		Params    map[string]any `json:"params"`
+		Engine          string         `json:"engine"`
+		Language        string         `json:"language"`
+		QueryKind       string         `json:"query_kind"`
+		Template        string         `json:"template"`
+		TemplateVersion string         `json:"template_version"`
+		EngineVersion   string         `json:"engine_version"`
+		Commit          string         `json:"commit"`
+		IRHash          string         `json:"ir_hash"`
+		Params          map[string]any `json:"params"`
 	}{
-		Engine:    engine,
-		Language:  language,
-		QueryKind: queryKind,
-		Template:  templateID,
-		Params:    params,
+		Engine:          engine,
+		Language:        language,
+		QueryKind:       queryKind,
+		Template:        templateID,
+		TemplateVersion: templateVersion,
+		EngineVersion:   strings.TrimSpace(engineVersion),
+		Commit:          strings.TrimSpace(commit),
+		IRHash:          strings.TrimSpace(irHash),
+		Params:          params,
 	}
 	encoded, err := json.Marshal(material)
 	if err != nil {
@@ -316,6 +349,70 @@ func queryCacheKeyParts(engine, language, queryKind, templateID string, params m
 	}
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
+}
+
+// IntentIRHash returns a deterministic hash of the engine-independent intent
+// IR. Runtime-only provenance is excluded so the same logical intent remains
+// cache-compatible across model invocations.
+func IntentIRHash(intent DetectionIntent) string {
+	material := struct {
+		Language         string      `json:"language"`
+		CWE              string      `json:"cwe"`
+		QueryKind        string      `json:"query_kind"`
+		Sources          []Pattern   `json:"sources"`
+		Sinks            []Pattern   `json:"sinks"`
+		Sanitizers       []Pattern   `json:"sanitizers"`
+		Propagators      []Pattern   `json:"propagators"`
+		Scope            Scope       `json:"scope"`
+		Constraints      Constraints `json:"constraints"`
+		PreferredEngines []string    `json:"preferred_engines"`
+	}{
+		Language:         normalizeIntentLanguage(intent.Language),
+		CWE:              normalizeCWEID(intent.CWE),
+		QueryKind:        strings.ToLower(strings.TrimSpace(intent.QueryKind)),
+		Sources:          sortedPatterns(intent.Sources),
+		Sinks:            sortedPatterns(intent.Sinks),
+		Sanitizers:       sortedPatterns(intent.Sanitizers),
+		Propagators:      sortedPatterns(intent.Propagators),
+		Scope:            canonicalScope(intent.Scope),
+		Constraints:      intent.Constraints,
+		PreferredEngines: sortedStrings(intent.PreferredEngines),
+	}
+	encoded, err := json.Marshal(material)
+	if err != nil {
+		encoded = []byte(fmt.Sprintf("%+v", material))
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+func sortedPatterns(patterns []Pattern) []Pattern {
+	out := append([]Pattern(nil), patterns...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Match != out[j].Match {
+			return out[i].Match < out[j].Match
+		}
+		if out[i].Pattern != out[j].Pattern {
+			return out[i].Pattern < out[j].Pattern
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+func sortedStrings(values []string) []string {
+	out := append([]string(nil), values...)
+	sort.Strings(out)
+	return out
+}
+
+func canonicalScope(scope Scope) Scope {
+	return Scope{
+		Paths:   sortedStrings(scope.Paths),
+		Modules: sortedStrings(scope.Modules),
+		Symbols: sortedStrings(scope.Symbols),
+		Exclude: sortedStrings(scope.Exclude),
+	}
 }
 
 // QueryCache is a bounded FIFO cache of rendered QuerySpec values. It is safe

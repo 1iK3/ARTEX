@@ -7,7 +7,7 @@ import {
   companyScopeRuleError,
   isCompanyScopeKind,
   normalizeCompanyScopeValue,
-} from "../company-scope";
+} from "../company-scope.ts";
 import type {
   Activity,
   ArchiveBatchItem,
@@ -34,7 +34,7 @@ import type {
   TrafficEvidenceRole,
   TrafficEvidenceSnapshot,
 } from "../types";
-import * as D from "./data";
+import * as D from "./data.ts";
 
 const delay = (ms = 120) => new Promise((r) => setTimeout(r, ms));
 
@@ -1173,6 +1173,9 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/audit/capabilities" && m === "GET") {
     return structuredClone(D.codeAuditCapabilities);
   }
+  if (path === "/worker-backends" && m === "GET") {
+    return structuredClone(D.auditWorkerBackends);
+  }
   if (seg[0] === "tasks" && seg[2] === "audit") {
     const owner = mockTasks.find((item) => item.id === seg[1]);
     if (!owner) throw new Error("任务不存在");
@@ -1211,11 +1214,21 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       }
       return progress;
     }
+    if (seg[3] === "findings" && seg[4] === "verification-batch" && m === "POST") {
+      const rawFindingIds = Array.isArray(b.finding_ids) ? b.finding_ids : [];
+      const findingIds = [...new Set(rawFindingIds.map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+      if (findingIds.length === 0) throw new Error("finding_ids 不能为空");
+      const verification = typeof b.verification === "string" ? b.verification : "";
+      if (!["confirmed", "refuted", "design_intent"].includes(verification)) {
+        throw new Error("verification 必须是 confirmed、refuted 或 design_intent");
+      }
+      const evidence = typeof b.evidence === "string" ? b.evidence.trim() : "";
+      if (!evidence) throw new Error("verification evidence 不能为空");
+      return { updated: findingIds.length, verification };
+    }
     if (seg[3] === "report" && m === "GET") {
       if (owner.status !== "done") throw new Error("审计报告尚未生成");
-      return q.get("format") === "json"
-        ? JSON.stringify(D.codeAuditReportJSON, null, 2)
-        : D.codeAuditReportMD;
+      return q.get("format") === "json" ? JSON.stringify(D.codeAuditReportJSON, null, 2) : D.codeAuditReportMD;
     }
     if (seg[3] === "source" && seg[4] === "file" && m === "GET") {
       const rawPath = (q.get("path") ?? "").replaceAll("\\", "/");
@@ -1256,12 +1269,14 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       if (!auditConfig) throw new Error("代码审计任务缺少 audit 配置");
       if (!["git", "local", "zip"].includes(auditConfig.source_type)) throw new Error("无效的 source_type");
       if (auditConfig.source_type === "git" && !auditConfig.repo_url?.trim()) throw new Error("repo_url 不能为空");
-      if (auditConfig.source_type === "local" && !auditConfig.local_path?.trim()) throw new Error("local_path 不能为空");
-      if (auditConfig.source_type === "zip" && !auditConfig.upload_id?.trim()) throw new Error("zip 审计必须提供 upload_id");
+      if (auditConfig.source_type === "local" && !auditConfig.local_path?.trim())
+        throw new Error("local_path 不能为空");
+      if (auditConfig.source_type === "zip" && !auditConfig.upload_id?.trim())
+        throw new Error("zip 审计必须提供 upload_id");
     }
     const profileIDs = [...((b.llm_profile_ids as number[] | undefined) ?? [])];
     const sourceTaskIDs = taskMode === "code_audit" ? [] : [...((b.source_task_ids as string[] | undefined) ?? [])];
-    const companyIDs = [...new Set(((b.company_ids as number[] | undefined) ?? []))];
+    const companyIDs = [...new Set((b.company_ids as number[] | undefined) ?? [])];
     if (companyIDs.some((companyID) => !mockCompanies.some((company) => company.id === companyID))) {
       throw new Error("关联企业不存在或无效");
     }
@@ -1269,9 +1284,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     const category = categoryID === undefined ? undefined : mockTaskCategories.find((item) => item.id === categoryID);
     if (categoryID !== undefined && !category) throw new Error("任务分类不存在");
     const defaultGoal =
-      taskMode === "code_audit"
-        ? `完成对 ${mockAuditSourceLabel(auditConfig)} 的全量深度代码审计`
-        : "";
+      taskMode === "code_audit" ? `完成对 ${mockAuditSourceLabel(auditConfig)} 的全量深度代码审计` : "";
     const created: Task = {
       id,
       name: String(b.name ?? ""),
@@ -1440,7 +1453,10 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     template.name = name;
     template.description = description;
     template.goal = goal;
-    if (b.task_mode === "pentest" || b.task_mode === "code_audit") template.task_mode = b.task_mode;
+    if (b.task_mode === "pentest" || b.task_mode === "code_audit") {
+      template.task_mode = b.task_mode;
+      if (b.task_mode === "pentest") delete template.audit_config;
+    }
     if (b.audit_config && typeof b.audit_config === "object") {
       template.audit_config = structuredClone(b.audit_config as AuditConfig);
     }

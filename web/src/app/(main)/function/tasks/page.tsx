@@ -120,6 +120,14 @@ import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
+import {
+  type AuditWorkerDraft,
+  applyAuditWorkerBackend,
+  auditWorkerDraftFromConfig,
+  buildAuditWorkerConfig,
+  changeAuditWorkerMode,
+  defaultAuditWorkerDraft,
+} from "@/lib/audit-worker";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { type SortDirection, useStoredSortPreference } from "@/lib/sort-preference";
 import type {
@@ -130,6 +138,10 @@ import type {
   AuditDepth,
   AuditEngineChoice,
   AuditSourceType,
+  AuditWorkerBackend,
+  AuditWorkerBackendOption,
+  AuditWorkerConfig,
+  AuditWorkerMode,
   ChatAttachment,
   Company,
   DeleteTaskOptions,
@@ -3493,6 +3505,166 @@ function AuditSourceFields({
   );
 }
 
+function AuditWorkerFields({
+  mode,
+  options,
+  draft,
+  onDraftChange,
+  onBackendChange,
+}: {
+  mode: TaskMode;
+  options: AuditWorkerBackendOption[];
+  draft: AuditWorkerDraft;
+  onDraftChange: (patch: Partial<AuditWorkerDraft>) => void;
+  onBackendChange: (backend: AuditWorkerBackend) => void;
+}) {
+  const isPentest = mode === "pentest";
+  const effectiveOptions =
+    options.length > 0
+      ? options
+      : [
+          {
+            backend: "builtin" as const,
+            label: "ARTEX 内置 Worker",
+            description: isPentest
+              ? "使用 ARTEX 内置 worker：在平台工具面与记录代理下执行渗透意图。"
+              : "使用 ARTEX 静态审计工具面，不执行目标代码。",
+            external: false,
+            requires_command: false,
+            available: true,
+            modes: ["static", "privileged"] as AuditWorkerMode[],
+            suggested_mode: "static" as const,
+          },
+        ];
+  const option = effectiveOptions.find((item) => item.backend === draft.backend);
+  const external = draft.backend !== "builtin";
+  const builtinBadge = isPentest ? "ARTEX 内置工具面" : "静态审计边界";
+  const builtinDescription = isPentest
+    ? "使用 ARTEX 内置 worker：在平台工具面与记录代理下执行渗透意图。"
+    : option?.description;
+
+  return (
+    <div className="grid gap-4 rounded-xl border bg-muted/15 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-sm font-medium">Worker 后端</div>
+        <span className="text-xs text-muted-foreground">
+          {draft.backend === "builtin" ? builtinBadge : "外部 CLI agent"}
+        </span>
+      </div>
+      <Field>
+        <FieldLabel htmlFor="audit-worker-backend">执行后端</FieldLabel>
+        <Select value={draft.backend} onValueChange={(value) => onBackendChange(value as AuditWorkerBackend)}>
+          <SelectTrigger id="audit-worker-backend" className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {effectiveOptions.map((item) => (
+              <SelectItem key={item.backend} value={item.backend}>
+                {item.label}
+                {item.available === false ? "（未检测到）" : ""}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <FieldDescription>
+          {external
+            ? option?.description
+            : (builtinDescription ?? (isPentest ? "选择执行本任务 worker 意图的运行时。" : "选择执行代码审计 worker 的运行时。"))}
+        </FieldDescription>
+      </Field>
+
+      {external && (
+        <>
+          <p className="text-xs text-muted-foreground">
+            {isPentest
+              ? "外部 CLI 以自带 agent 领取 ARTEX 规划的每条意图，在任务的意图工件目录内执行；返回的 summary 会写回为事实、findings 记入漏洞表。"
+              : "外部 CLI 在源码快照上执行审计意图，结果按 candidate 入库。"}
+          </p>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field>
+              <FieldLabel htmlFor="audit-worker-mode">权限模式</FieldLabel>
+              <Select
+                value={draft.mode}
+                onValueChange={(value) =>
+                  onDraftChange(changeAuditWorkerMode(draft, value as AuditWorkerMode, effectiveOptions))
+                }
+              >
+                <SelectTrigger id="audit-worker-mode" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="static">静态模式</SelectItem>
+                  <SelectItem value="privileged">高权限模式</SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="audit-worker-timeout">超时（秒）</FieldLabel>
+              <Input
+                id="audit-worker-timeout"
+                type="number"
+                min={1}
+                max={86400}
+                placeholder="默认 3600"
+                value={draft.timeoutSeconds}
+                onChange={(event) => onDraftChange({ timeoutSeconds: event.target.value })}
+              />
+            </Field>
+          </div>
+
+          <Field>
+            <FieldLabel htmlFor="audit-worker-command">命令</FieldLabel>
+            <Input
+              id="audit-worker-command"
+              placeholder={draft.backend === "custom" ? "例如 my-worker.exe" : "codex"}
+              value={draft.command}
+              onChange={(event) => onDraftChange({ command: event.target.value })}
+            />
+            <FieldDescription>直接填写可执行文件名或绝对路径；ARTEX 不做 shell 拼接。</FieldDescription>
+          </Field>
+
+          <Field>
+            <FieldLabel htmlFor="audit-worker-args">参数（每行一个 argv）</FieldLabel>
+            <Textarea
+              id="audit-worker-args"
+              className="min-h-28 font-mono text-xs"
+              placeholder={"exec\n{{input_file}}\n{{output_file}}"}
+              value={draft.args}
+              onChange={(event) => onDraftChange({ args: event.target.value })}
+            />
+            <FieldDescription>
+              支持占位符 task_id、intent_id、workspace、snapshot_root、prompt、input_file、output_file、schema_file。
+            </FieldDescription>
+          </Field>
+
+          {draft.mode === "privileged" && (
+            <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3">
+              <label htmlFor="audit-worker-privileged" className="flex items-start gap-2 text-sm font-medium">
+                <Checkbox
+                  id="audit-worker-privileged"
+                  checked={draft.privilegedConfirmed}
+                  onCheckedChange={(value) => onDraftChange({ privilegedConfirmed: value === true })}
+                />
+                我确认允许该外部 CLI 使用自带最高权限
+              </label>
+              <p className="mt-2 text-xs text-red-700 dark:text-red-300">
+                高权限模式会突破 ARTEX 静态审计边界。外部 CLI 可访问本机文件、网络、Bash
+                和自身登录态；ARTEX 不提供沙箱、凭据隔离或动作级审计。
+              </p>
+            </div>
+          )}
+
+          {option && option.available === false && (
+            <p className="text-xs text-muted-foreground">
+              未在服务端 PATH 检测到建议命令；仍可提交自定义命令，执行前请确认 CLI 可用。
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function CreateTaskSheet({
   tasks,
   categories,
@@ -3545,6 +3717,8 @@ function CreateTaskSheet({
   const [includeVendor, setIncludeVendor] = React.useState(false);
   const [capabilities, setCapabilities] = React.useState<AuditCapabilities | null>(null);
   const [capabilitiesLoading, setCapabilitiesLoading] = React.useState(false);
+  const [workerBackendOptions, setWorkerBackendOptions] = React.useState<AuditWorkerBackendOption[]>([]);
+  const [workerDraft, setWorkerDraft] = React.useState<AuditWorkerDraft>(defaultAuditWorkerDraft());
   // zip 上传使用独立 draft id：后端要求该 staging 目录里只能有一个压缩包。
   const [zipFile, setZipFile] = React.useState<File | null>(null);
   const [zipUploadID, setZipUploadID] = React.useState("");
@@ -3580,6 +3754,22 @@ function CreateTaskSheet({
     void loadAuditCapabilities();
   }, [open, loadAuditCapabilities]);
 
+  React.useEffect(() => {
+    if (!open) return;
+    let canceled = false;
+    api
+      .workerBackends()
+      .then((result) => {
+        if (!canceled) setWorkerBackendOptions(result.backends);
+      })
+      .catch(() => {
+        if (!canceled) setWorkerBackendOptions([]);
+      });
+    return () => {
+      canceled = true;
+    };
+  }, [open]);
+
   function resetAuditState() {
     setAuditSourceType("git");
     setRepoURL("");
@@ -3597,6 +3787,7 @@ function CreateTaskSheet({
     setIncludeVendor(false);
     setZipFile(null);
     setZipUploadID("");
+    setWorkerDraft(defaultAuditWorkerDraft());
   }
 
   function applyAuditConfig(config: AuditConfig) {
@@ -3622,6 +3813,7 @@ function CreateTaskSheet({
     setJoernEngine(engines.joern === "off" ? "off" : "auto");
     setIncludeTests(Boolean(config.include_tests));
     setIncludeVendor(Boolean(config.include_vendor));
+    setWorkerDraft(auditWorkerDraftFromConfig(config));
     // 模板里的 upload_id 属于旧上传，不能复用；切到 zip 时必须重新选择文件。
     setZipFile(null);
     setZipUploadID("");
@@ -3720,6 +3912,12 @@ function CreateTaskSheet({
         toast.error("深度审计必须启用 CodeGraph");
         return;
       }
+      try {
+        buildAuditWorkerConfig(workerDraft);
+      } catch (error) {
+        toast.error((error as Error).message);
+        return;
+      }
     } else if (!description.trim() || !goal.trim()) {
       toast.error("请填写描述与目标");
       return;
@@ -3733,6 +3931,13 @@ function CreateTaskSheet({
       const timeoutSec = Math.max(0, Math.floor(Number(timeoutMin) || 0)) * 60;
       const heartbeatSec = Math.max(10, Math.floor(Number(heartbeatMin) || 10)) * 60; // 下限 10min，与后端归一一致
       let audit: AuditConfig | undefined;
+      let worker: AuditWorkerConfig | undefined;
+      try {
+        worker = buildAuditWorkerConfig(workerDraft);
+      } catch (error) {
+        toast.error((error as Error).message);
+        return;
+      }
       if (isCodeAudit) {
         const parsedLanguages = splitList(languages);
         audit = {
@@ -3760,6 +3965,7 @@ function CreateTaskSheet({
         goal: goal.trim(),
         taskMode,
         ...(audit ? { audit } : {}),
+        ...(worker ? { worker } : {}),
         llmProfileIds: llmProfileIDs.map(Number),
         sourceTaskIds: isCodeAudit ? [] : sourceTaskIDs,
         companyIds: isCodeAudit ? [] : companyIDs,
@@ -3974,6 +4180,15 @@ function CreateTaskSheet({
                 onIncludeVendorChange={setIncludeVendor}
               />
             )}
+            <AuditWorkerFields
+              mode={taskMode}
+              options={workerBackendOptions}
+              draft={workerDraft}
+              onDraftChange={(patch) => setWorkerDraft((current) => ({ ...current, ...patch }))}
+              onBackendChange={(backend) =>
+                setWorkerDraft(applyAuditWorkerBackend(backend, workerBackendOptions))
+              }
+            />
             <input
               ref={zipInputRef}
               type="file"

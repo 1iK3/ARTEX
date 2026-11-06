@@ -801,7 +801,7 @@ const (
 //   - failed gates with remaining sink candidates stay in the loop;
 //   - failed gates without any actionable candidate produce a partial report so
 //     the task cannot hang forever.
-func decideAuditCompletion(activeIntents, unverifiedFindings int, gatesPassed, atMaxRounds, hasSinkCandidates bool) auditCompletionDecision {
+func decideAuditCompletion(activeIntents, unverifiedFindings int, gatesPassed, atMaxRounds bool, zeroNewStreak int, hasSinkCandidates, hasPhaseCandidates bool) auditCompletionDecision {
 	switch {
 	case activeIntents > 0:
 		return auditDecisionWait
@@ -811,6 +811,10 @@ func decideAuditCompletion(activeIntents, unverifiedFindings int, gatesPassed, a
 		return auditDecisionComplete
 	case atMaxRounds:
 		return auditDecisionCompleteWithGaps
+	case zeroNewStreak >= 2:
+		return auditDecisionCompleteWithGaps
+	case hasPhaseCandidates:
+		return auditDecisionWait
 	case hasSinkCandidates:
 		return auditDecisionRetryCoverage
 	default:
@@ -882,7 +886,17 @@ func (d *AuditDirector) maybeCompleteAudit(t *Task, session *db.AuditSession) {
 	if err != nil {
 		return
 	}
-	phases, skipped, err := d.skipEmptyAuditPhases(session, phases, phaseIntentCounts, plan, rows, now)
+	confirmed, err := listAuditConfirmedHighFindings(ctx, d.s.m.pg, taskID, 200)
+	if err != nil {
+		log.Printf("[audit] task %s 读取高危 confirmed finding 失败: %v", t.ID, err)
+		return
+	}
+	phaseCandidates := buildAuditPhaseCandidates(plan, phases, confirmed)
+	actionablePhases := make(map[string]bool, len(phaseCandidates))
+	for _, candidate := range phaseCandidates {
+		actionablePhases[candidate.Phase] = true
+	}
+	phases, skipped, err := d.skipEmptyAuditPhases(session, phases, phaseIntentCounts, plan, rows, actionablePhases, now)
 	if err != nil {
 		log.Printf("[audit] task %s 跳过无可执行阶段失败: %v", t.ID, err)
 		d.emit(t, db.Activity{Worker: "system", Kind: "text", IsError: true,
@@ -895,18 +909,40 @@ func (d *AuditDirector) maybeCompleteAudit(t *Task, session *db.AuditSession) {
 	}
 
 	coverageRows := auditCoverageRows(rows)
-	gates := auditGates(plan, auditCompletionPhaseStatuses(phases), coverageRows)
+	hypotheses, err := d.s.m.pg.ListAuditHypotheses(session.ID)
+	if err != nil {
+		log.Printf("[audit] task %s 读取审计假设失败: %v", t.ID, err)
+		return
+	}
+	engineJobs, err := d.s.m.pg.ListAuditEngineJobs(session.ID)
+	if err != nil {
+		log.Printf("[audit] task %s 读取引擎作业失败: %v", t.ID, err)
+		return
+	}
+	counts, err := d.s.m.pg.CountAuditRoundFindings(taskID, session.Round)
+	if err != nil {
+		log.Printf("[audit] task %s 统计本轮新增 finding 失败: %v", t.ID, err)
+		return
+	}
+	gates := auditGates(
+		plan, auditCompletionPhaseStatuses(phases), coverageRows,
+		hypotheses, counts.TotalFindings, engineJobs, parseAuditEnginesRecord(session.Engines),
+	)
 	gatesPassed := auditGatesPassed(gates)
-	// M1 deliberately keeps round=1 and does not advance rounds. A session with a
-	// missing/legacy MaxRounds still gets the forced-partial path by treating the
-	// budget as one round; multi-round focused re-scan is not implemented yet.
 	effectiveMaxRounds := session.MaxRounds
 	if effectiveMaxRounds < 1 {
 		effectiveMaxRounds = 1
 	}
 	atMaxRounds := session.Round >= effectiveMaxRounds
 
-	if !gatesPassed && !atMaxRounds {
+	roundHistory, err := d.s.m.pg.ListAuditRounds(session.ID)
+	if err != nil {
+		log.Printf("[audit] task %s 读取轮次历史失败: %v", t.ID, err)
+		return
+	}
+	zeroNewStreak := auditZeroNewStreak(roundHistory, session.Round, counts.NewFindings)
+
+	if !gatesPassed && !atMaxRounds && zeroNewStreak < 2 {
 		released, releaseErr := d.releaseResidualCoverage(session, rows)
 		if releaseErr != nil {
 			log.Printf("[audit] task %s 释放未完成覆盖行失败: %v", t.ID, releaseErr)
@@ -926,14 +962,29 @@ func (d *AuditDirector) maybeCompleteAudit(t *Task, session *db.AuditSession) {
 	}
 
 	sinkCandidates := buildAuditCoverageCandidates(rows, 8, 25)
-	decision := decideAuditCompletion(0, 0, gatesPassed, atMaxRounds, len(sinkCandidates) > 0)
+	decision := decideAuditCompletion(0, 0, gatesPassed, atMaxRounds, zeroNewStreak,
+		len(sinkCandidates) > 0, len(phaseCandidates) > 0)
 	switch decision {
-	case auditDecisionWait, auditDecisionRequestVerification:
+	case auditDecisionWait:
+		d.emit(t, db.Activity{Worker: "system", Kind: "text",
+			Summary: "代码审计：存在待派发的深度阶段候选，等待规划者派发 S3/S6/S7/S8/S9/S10 意图"})
+		t.Notify()
+		return
+	case auditDecisionRequestVerification:
 		return
 	case auditDecisionRetryCoverage:
+		decisionName := auditRoundDecisionName(decision, atMaxRounds, zeroNewStreak)
+		if err := d.advanceAuditRound(t, session, phases, rows, gates, counts, decisionName, zeroNewStreak, now); err != nil {
+			log.Printf("[audit] task %s 推进审计轮次失败: %v", t.ID, err)
+			d.emit(t, db.Activity{Worker: "system", Kind: "text", IsError: true,
+				Summary: "代码审计：推进审计轮次失败，保持当前轮次", Detail: err.Error()})
+			t.Notify()
+			return
+		}
 		d.emit(t, db.Activity{
 			Worker: "system", Kind: "text",
-			Summary: "代码审计：门禁未通过，已释放未完成覆盖并通知规划者补扫（M1 不自动增加轮次）: " + auditGateGapSummary(gates),
+			Summary: fmt.Sprintf("代码审计：门禁未通过，进入第 %d/%d 轮聚焦补扫（本轮零新增连续 %d 轮）: %s",
+				session.Round+1, effectiveMaxRounds, zeroNewStreak, auditGateGapSummary(gates)),
 		})
 		t.Notify()
 		return
@@ -942,6 +993,10 @@ func (d *AuditDirector) maybeCompleteAudit(t *Task, session *db.AuditSession) {
 		forced := decision == auditDecisionCompleteWithGaps || !gatesPassed
 		if forced {
 			status = db.AuditStatusDoneWithGaps
+		}
+		decisionName := auditRoundDecisionName(decision, atMaxRounds, zeroNewStreak)
+		if err := d.recordAuditRound(session, counts, decisionName, zeroNewStreak, gates, now); err != nil {
+			log.Printf("[audit] task %s 写入轮次决策记录失败: %v", t.ID, err)
 		}
 		if err := d.persistAuditCompletion(ctx, t, session, phases, rows, gates, status, forced, now); err != nil {
 			log.Printf("[audit] task %s 生成审计报告失败: %v", t.ID, err)
@@ -957,6 +1012,216 @@ func (d *AuditDirector) maybeCompleteAudit(t *Task, session *db.AuditSession) {
 		})
 		t.Notify()
 	}
+}
+
+// auditZeroNewStreak counts consecutive completed rounds (ending at the
+// current one) that produced no new findings. History rows at or after the
+// current round are ignored so an idempotent re-entry cannot double-count.
+func auditZeroNewStreak(history []db.AuditRound, currentRound, currentNewFindings int) int {
+	streak := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Round >= currentRound {
+			continue
+		}
+		if history[i].NewFindings != 0 {
+			break
+		}
+		streak++
+	}
+	if currentNewFindings == 0 {
+		streak++
+	}
+	return streak
+}
+
+// auditGateOutcome renders one gate result for the audit_rounds ledger.
+func auditGateOutcome(gates map[string]audit.GateResult, key string) string {
+	if gate, ok := gates[key]; ok && gate.Passed {
+		return "pass"
+	}
+	return "fail"
+}
+
+// auditRoundDecisionName maps a completion decision to the persistent,
+// human-readable decision recorded on the round ledger.
+func auditRoundDecisionName(decision auditCompletionDecision, atMaxRounds bool, zeroNewStreak int) string {
+	switch decision {
+	case auditDecisionComplete:
+		return "complete"
+	case auditDecisionCompleteWithGaps:
+		if zeroNewStreak >= 2 {
+			return "converged"
+		}
+		if atMaxRounds {
+			return "forced"
+		}
+		return "no_candidates"
+	default:
+		return "continue"
+	}
+}
+
+// auditHypothesisRoundOutcome records the non-blocking Gate-H score warning in
+// the round ledger while preserving hard failures as discipline gaps.
+func auditHypothesisRoundOutcome(gate audit.GateResult) string {
+	if !gate.Passed {
+		return "discipline_gap"
+	}
+	if warning, _ := gate.Details["warning"].(bool); warning {
+		return "warn"
+	}
+	return "pass"
+}
+
+// auditEngineGateOutcome reports Gate-Engine health. An engine drops below the
+// success-rate threshold when fewer than 80% of its attempted jobs completed.
+func auditEngineGateOutcome(jobs []db.AuditEngineJob) string {
+	type counts struct{ done, failed int }
+	byEngine := make(map[string]counts)
+	for i := range jobs {
+		engine := strings.ToLower(strings.TrimSpace(jobs[i].Engine))
+		if engine == "" {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(jobs[i].Status)) {
+		case "done":
+			value := byEngine[engine]
+			value.done++
+			byEngine[engine] = value
+		case "failed":
+			value := byEngine[engine]
+			value.failed++
+			byEngine[engine] = value
+		}
+	}
+	for _, value := range byEngine {
+		attempted := value.done + value.failed
+		if attempted > 0 && float64(value.done)/float64(attempted) < 0.8 {
+			return "degraded"
+		}
+	}
+	return "pass"
+}
+
+const maxAuditHypothesisAttempts = 3
+
+// recordAuditRound persists one round's finding delta, gate outcomes, and the
+// decision that closed the round. It is idempotent (last write wins).
+func (d *AuditDirector) recordAuditRound(session *db.AuditSession, counts db.AuditRoundCounts, decision string, zeroNewStreak int, gates map[string]audit.GateResult, now time.Time) error {
+	if session == nil {
+		return errors.New("审计会话不存在，无法写入轮次记录")
+	}
+	gateC := "continue"
+	switch {
+	case zeroNewStreak >= 2:
+		gateC = "converged"
+	case decision == "complete":
+		gateC = "pass"
+	}
+	focus := map[string]any{
+		"zero_new_streak": zeroNewStreak,
+		"gate_gaps":       auditGateGapSummary(gates),
+	}
+	focusRaw, err := json.Marshal(focus)
+	if err != nil {
+		return fmt.Errorf("序列化轮次焦点失败: %w", err)
+	}
+	_ = now
+	return d.s.m.pg.InsertAuditRound(db.AuditRound{
+		SessionID: session.ID, Round: session.Round,
+		NewFindings: counts.NewFindings, NewConfirmed: counts.NewConfirmed,
+		NewCandidate: counts.NewCandidate, TotalFindings: counts.TotalFindings,
+		GateC: gateC, GateCWE: auditGateOutcome(gates, "cwe"),
+		GateH:        auditHypothesisRoundOutcome(gates["hypothesis"]),
+		GateE:        auditGateOutcome(gates, "engine"),
+		GateCoverage: auditGateOutcome(gates, "coverage"),
+		GateEngine:   auditGateOutcome(gates, "engine"),
+		Decision:     decision,
+		Focus:        focusRaw,
+	})
+}
+
+// nextAuditRoundCoverageRows copies the round ledger forward: terminal
+// coverage states carry over so cumulative gates keep passing, while
+// planned/missed rows reset to unowned planned for the next round's workers.
+func nextAuditRoundCoverageRows(sessionID int64, round int, current []db.AuditCoverage) []db.AuditCoverage {
+	out := make([]db.AuditCoverage, 0, len(current))
+	for _, row := range current {
+		next := row
+		next.ID = 0
+		next.SessionID = sessionID
+		next.Round = round
+		next.IntentID = nil
+		next.CreatedAt = time.Time{}
+		next.UpdatedAt = time.Time{}
+		switch strings.ToLower(strings.TrimSpace(row.Status)) {
+		case audit.CoverageStatusPlanned, audit.CoverageStatusMissed:
+			next.Status = audit.CoverageStatusPlanned
+			next.Reason = ""
+		}
+		out = append(out, next)
+	}
+	return out
+}
+
+// nextAuditRoundPhases mirrors the phase ledger into the next round: S0 never
+// repeats, terminal phases carry their status, and failed/pending phases
+// reset to pending so the planner can redispatch them.
+func nextAuditRoundPhases(sessionID int64, round int, current []db.AuditPhase) []db.AuditPhase {
+	out := make([]db.AuditPhase, 0, len(current))
+	for _, row := range current {
+		if row.Phase == audit.PhaseIngest {
+			continue
+		}
+		next := db.AuditPhase{
+			SessionID: sessionID, Round: round, Phase: row.Phase, Required: row.Required,
+			Gate: row.Gate, Stats: row.Stats,
+		}
+		switch strings.ToLower(strings.TrimSpace(row.Status)) {
+		case "done", "skipped", "exempt":
+			next.Status = row.Status
+			next.CompletedAt = row.CompletedAt
+		default:
+			next.Status = "pending"
+		}
+		out = append(out, next)
+	}
+	return out
+}
+
+// advanceAuditRound closes the current round on the ledger, increments the
+// session round, and seeds the next round's phase/coverage rows. It is the
+// single entry point for multi-round focused re-scan.
+func (d *AuditDirector) advanceAuditRound(t *Task, session *db.AuditSession, phases []db.AuditPhase, rows []db.AuditCoverage, gates map[string]audit.GateResult, counts db.AuditRoundCounts, decision string, zeroNewStreak int, now time.Time) error {
+	if session == nil {
+		return errors.New("审计会话不存在，无法推进轮次")
+	}
+	if err := d.recordAuditRound(session, counts, decision, zeroNewStreak, gates, now); err != nil {
+		return fmt.Errorf("写入轮次记录失败: %w", err)
+	}
+	nextRound := session.Round + 1
+	nextPhases := nextAuditRoundPhases(session.ID, nextRound, phases)
+	if err := d.s.m.pg.InsertAuditPhases(session.ID, nextRound, nextPhases); err != nil {
+		return fmt.Errorf("写入第 %d 轮阶段失败: %w", nextRound, err)
+	}
+	for _, phase := range nextPhases {
+		if err := d.s.m.pg.UpdateAuditPhase(session.ID, nextRound, phase.Phase, db.AuditPhaseUpdate{
+			Required: phase.Required, SetRequired: true,
+		}); err != nil {
+			return fmt.Errorf("更新第 %d 轮阶段 %s 失败: %w", nextRound, phase.Phase, err)
+		}
+	}
+	if err := d.s.m.pg.UpsertAuditCoverage(nextAuditRoundCoverageRows(session.ID, nextRound, rows)); err != nil {
+		return fmt.Errorf("写入第 %d 轮覆盖行失败: %w", nextRound, err)
+	}
+	round := nextRound
+	if _, err := d.s.m.pg.UpdateAuditSession(session.TaskID, db.AuditSessionUpdate{
+		Round: &round,
+	}); err != nil {
+		return fmt.Errorf("更新审计会话轮次失败: %w", err)
+	}
+	session.Round = nextRound
+	return nil
 }
 
 // summarizeAuditIntents counts active current-round audit intents and the
@@ -1082,7 +1347,7 @@ func auditHasPendingCoverageKind(rows []db.AuditCoverage, kind string) bool {
 // skipEmptyAuditPhases marks yet-pending required phases that genuinely have no
 // work. S1/S2 are skipped only when the plan itself has no targets; S4 is skipped
 // only when no sink-site rows exist. Phases with real targets remain pending.
-func (d *AuditDirector) skipEmptyAuditPhases(session *db.AuditSession, phases []db.AuditPhase, phaseIntents map[string]int, plan audit.Plan, rows []db.AuditCoverage, now time.Time) ([]db.AuditPhase, []string, error) {
+func (d *AuditDirector) skipEmptyAuditPhases(session *db.AuditSession, phases []db.AuditPhase, phaseIntents map[string]int, plan audit.Plan, rows []db.AuditCoverage, actionablePhases map[string]bool, now time.Time) ([]db.AuditPhase, []string, error) {
 	skipped := make([]string, 0)
 	for i := range phases {
 		phase := &phases[i]
@@ -1091,6 +1356,9 @@ func (d *AuditDirector) skipEmptyAuditPhases(session *db.AuditSession, phases []
 		}
 		status := strings.ToLower(strings.TrimSpace(phase.Status))
 		if status != "" && status != "pending" {
+			continue
+		}
+		if actionablePhases[phase.Phase] {
 			continue
 		}
 		reason, canSkip := auditSkipReason(phase.Phase, phaseIntents[phase.Phase], plan, rows)
@@ -1163,7 +1431,7 @@ func auditCompletionPhaseStatuses(phases []db.AuditPhase) []audit.PhaseStatus {
 }
 
 func auditGateGapSummary(gates map[string]audit.GateResult) string {
-	order := []string{"phase", "coverage", "cwe"}
+	order := []string{"phase", "coverage", "cwe", "hypothesis", "engine"}
 	parts := make([]string, 0, len(order))
 	for _, key := range order {
 		gate, ok := gates[key]
@@ -1651,6 +1919,19 @@ func auditPlanCoverageRows(sessionID int64, plan audit.Plan, sites []audit.SinkS
 		rows = append(rows, db.AuditCoverage{
 			SessionID: sessionID, Round: 1, Kind: audit.CoverageKindModule,
 			Language: primary, Module: module, SinkKey: "module:" + module,
+			Status: audit.CoverageStatusPlanned, Engine: backend,
+		})
+	}
+	entryPoints := append([]string(nil), plan.EntryPoints...)
+	sort.Strings(entryPoints)
+	for _, entryPoint := range entryPoints {
+		entryPoint = strings.TrimSpace(entryPoint)
+		if entryPoint == "" {
+			continue
+		}
+		rows = append(rows, db.AuditCoverage{
+			SessionID: sessionID, Round: 1, Kind: audit.CoverageKindEntryPoint,
+			Language: primary, Symbol: entryPoint, SinkKey: "entry:" + entryPoint,
 			Status: audit.CoverageStatusPlanned, Engine: backend,
 		})
 	}
